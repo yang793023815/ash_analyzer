@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ash_analyzer 使用手册 — Oracle ASH 历史性能 / 阻塞分析工具</title>
+<style>
+  :root{
+    --ink:#1a1d21; --sub:#5c6470; --line:#d9dde3; --bg:#fafaf8;
+    --accent:#0f5c8c; --accent-soft:#e8f1f7; --warn:#8a4a0b; --warn-soft:#fdf3e7;
+    --ok:#1e6b45; --ok-soft:#e9f4ee; --bad:#a02c2c; --bad-soft:#faecec;
+    --mono:'SF Mono',Menlo,Consolas,'Courier New',monospace;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:-apple-system,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+       color:var(--ink); background:var(--bg); line-height:1.75; font-size:15px;}
+  .wrap{max-width:960px; margin:0 auto; padding:48px 28px 80px;}
+  header.doc{border-bottom:3px solid var(--ink); padding-bottom:24px; margin-bottom:36px;}
+  header.doc .kicker{font-size:13px; letter-spacing:.14em; color:var(--accent); font-weight:600; margin-bottom:8px;}
+  header.doc h1{font-size:32px; font-weight:700; letter-spacing:.01em; line-height:1.25;}
+  header.doc .sub{margin-top:10px; color:var(--sub); font-size:14.5px;}
+  header.doc .meta{margin-top:16px; font-size:12.5px; color:var(--sub);
+    font-family:var(--mono); background:#f0f1ee; border:1px solid var(--line);
+    padding:8px 12px; display:inline-block;}
+  h2{font-size:20px; margin:44px 0 14px; padding-top:18px; border-top:1px solid var(--line);
+     display:flex; align-items:baseline; gap:10px;}
+  h2 .no{color:var(--accent); font-family:var(--mono); font-size:15px; font-weight:700;}
+  h3{font-size:15.5px; margin:22px 0 8px;}
+  p{margin:10px 0;}
+  ul,ol{margin:10px 0 10px 22px;}
+  li{margin:4px 0;}
+  code{font-family:var(--mono); font-size:13px; background:#eef0ea; padding:1px 5px; border-radius:3px;}
+  pre{font-family:var(--mono); font-size:12.5px; line-height:1.6; background:#22272b; color:#e8eaed;
+      padding:14px 16px; overflow-x:auto; margin:12px 0; border-left:3px solid var(--accent);}
+  pre .c{color:#8aa08f;}
+  table{width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px;}
+  th,td{border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top;}
+  th{background:#f0f1ee; font-weight:600; font-size:12.5px; letter-spacing:.02em;}
+  td.mono, th.mono{font-family:var(--mono); font-size:12.5px;}
+  .lead{font-size:16px; color:var(--ink);}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0;}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr;}}
+  .card{background:#fff; border:1px solid var(--line); padding:16px 18px;}
+  .card h4{font-size:14px; margin-bottom:6px; color:var(--accent);}
+  .card p{font-size:13.5px; color:var(--sub); margin:0;}
+  .callout{border:1px solid var(--line); border-left:4px solid var(--accent); background:var(--accent-soft);
+    padding:12px 16px; margin:14px 0; font-size:14px;}
+  .callout.warn{border-left-color:var(--warn); background:var(--warn-soft);}
+  .callout b{display:block; margin-bottom:4px;}
+  .tag{display:inline-block; font-size:11.5px; font-family:var(--mono); padding:1px 8px;
+    border:1px solid var(--line); background:#fff; margin-right:6px; border-radius:2px;}
+  .tag.g{border-color:var(--ok); color:var(--ok); background:var(--ok-soft);}
+  .tag.b{border-color:var(--bad); color:var(--bad); background:var(--bad-soft);}
+  /* 六步法时间线 */
+  .steps{margin:18px 0; border-left:2px solid var(--line);}
+  .step{position:relative; padding:2px 0 18px 26px;}
+  .step::before{content:attr(data-n); position:absolute; left:-13px; top:0; width:24px; height:24px;
+    background:var(--accent); color:#fff; border-radius:50%; text-align:center; line-height:24px;
+    font-size:12.5px; font-weight:700; font-family:var(--mono);}
+  .step h4{font-size:14.5px; margin-bottom:2px;}
+  .step .cmd{font-family:var(--mono); font-size:12px; background:#22272b; color:#cde3f2;
+    padding:6px 10px; margin:6px 0; overflow-x:auto; white-space:pre;}
+  .step p{font-size:13.5px; color:var(--sub); margin:2px 0;}
+  /* 因果链图 */
+  .chainflow{background:#fff; border:1px solid var(--line); padding:20px 18px; margin:14px 0;}
+  .chainflow svg{width:100%; height:auto; display:block;}
+  .chainflow .cap{font-size:12.5px; color:var(--sub); margin-top:10px; text-align:center;}
+  footer{margin-top:56px; padding-top:16px; border-top:1px solid var(--line);
+    font-size:12px; color:var(--sub); display:flex; justify-content:space-between;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="kicker">ORACLE ASH · RAC &amp; 单实例 · 11.2.0.4 – 19c+ · 跨环境导入分析</div>
+  <h1>ash_analyzer 使用手册</h1>
+  <div class="sub">Oracle ASH 历史性能 / 阻塞分析工具 —— 事后凭 ASH 数据还原问题窗口、症状、根阻塞者与完整等待链；异环境导出数据直接分析</div>
+  <div class="meta">v1.2 · 2026-09-22 · 部署: qone1:/home/oracle/ash_analyzer/ash_analyzer · qone2:~/ash_analyzer/ · 10.10.180.201:~/ash_analyzer/（真19c） · md5 2da8c8ca…64d9 · 单文件 bash + sqlplus，零依赖</div>
+</header>
+
+<p class="lead">问题发生时 DBA 往往不在场。ash_analyzer 用 ASH 持久化数据做<b>事后复盘</b>：定位问题精确窗口 → 分类症状 → 找到根阻塞者（以及它自己在等什么）→ 还原完整等待链（含 RAC 跨实例）→ 判定会话是否卡死。</p>
+
+<div class="grid2">
+  <div class="card"><h4>覆盖数据源</h4><p>gv$active_session_history（实时全库 1s）· v$（本实例 1s）· dba_hist_active_sess_history（AWR 10s）· 任意 CTAS/impdp 导入的 ASH 表——<b>按列自动识别布局</b>，缺列自动降级</p></div>
+  <div class="card"><h4>可移植性</h4><p>单文件、纯 bash + sqlplus。拷到任意 Oracle 服务器即可运行：自动探测 ORACLE_SID（pmon，跳过 +ASM/-MGMTDB）与 ORACLE_HOME（oratab），支持 -s 多实例切换、-c 远程连接串</p></div>
+</div>
+
+<h2><span class="no">01</span>部署与运行</h2>
+<pre>chmod +x ash_analyzer
+./ash_analyzer help                 <span class="c"># 中文帮助</span>
+./ash_analyzer info                 <span class="c"># 体检默认数据源 (hist)</span>
+./ash_analyzer info -i gv           <span class="c"># 体检实时 gv$ 视图</span>
+./ash_analyzer info -s lcbdg1       <span class="c"># 多实例主机切换目标库</span>
+./ash_analyzer events -c 'user/pwd@tns' -m 60</pre>
+<p>无需任何配置文件；<code>-s SID</code> 在多实例主机（如 qone1 上的 orcl1 / lcbdg1）间切换，<code>-c</code> 支持远程 EZConnect / TNS。</p>
+
+<h2><span class="no">02</span>数据源与自动识别</h2>
+<table>
+  <tr><th class="mono">-i 参数</th><th>实际数据源</th><th class="mono">布局</th><th class="mono">间隔</th></tr>
+  <tr><td class="mono">hist（默认）</td><td>dba_hist_active_sess_history</td><td class="mono">hist</td><td class="mono">10s</td></tr>
+  <tr><td class="mono">gv</td><td>gv$active_session_history</td><td class="mono">gv</td><td class="mono">1s</td></tr>
+  <tr><td class="mono">v</td><td>v$active_session_history</td><td class="mono">single</td><td class="mono">1s</td></tr>
+  <tr><td class="mono">任意表名</td><td>CTAS / impdp 导入的 ASH 表</td><td class="mono">自动</td><td class="mono">自动</td></tr>
+</table>
+<p>识别按<b>列存在性</b>：有 <code>INST_ID</code> → gv；有 <code>SNAP_ID</code>+<code>INSTANCE_NUMBER</code> → hist；仅 <code>INSTANCE_NUMBER</code> → hist 并提示；都没有 → single。19c/11.2 列集差异安全：缺 <code>BLOCKING_INST_ID</code> 时阻塞链退化为仅同实例匹配（有提示）、缺 PGA/TEMP 列时 <code>res</code> 干净退出、缺 <code>SQL_EXEC_ID</code> 跳过长执行识别。</p>
+
+<div class="callout"><b>跨环境导入分析（v1.1）</b>其他库导出的 ASH 表（含视图）用 <code>-i</code> 直接分析，布局自动识别；数据 DBID 与本地不一致时 <code>info</code> 自动提示。源库的 current_obj#/user_id/SQL 文本属源库，配套映射表解析：<br>
+<code>-objmap</code> 对象表（OBJECT_ID/OWNER/OBJECT_NAME）· <code>-sqlmap</code> SQL文本表（SQL_ID+SQL_TEXT|SQL_FULLTEXT）· <code>-usermap</code> 用户表（USER_ID/USERNAME）。多库合并导入用 <code>-D dbid</code> 锁定。</div>
+
+<h2><span class="no">03</span>命令一览</h2>
+<table>
+  <tr><th class="mono">命令</th><th>作用</th><th>关键输出</th></tr>
+  <tr><td class="mono">info</td><td>数据源体检</td><td>行数 / 时间范围 / 各实例分布 / 密度Top24 / 采样断档</td></tr>
+  <tr><td class="mono">trend</td><td>活动会话趋势</td><td>每分钟直方图 + 峰值样本点</td></tr>
+  <tr><td class="mono">events</td><td>顶级等待事件</td><td>事件排行（ON CPU 合并）+ 事件×SQL 交叉</td></tr>
+  <tr><td class="mono">sql</td><td>SQL 排行</td><td>样本数排行 + sql_exec_id 长执行识别</td></tr>
+  <tr><td class="mono">sessions</td><td>会话排行</td><td>用户 / 程序 / 机器解析</td></tr>
+  <tr><td class="mono">blockers</td><td>阻塞分析</td><td>直接阻塞者表 + <b>根阻塞者等待树</b></td></tr>
+  <tr><td class="mono">chain</td><td>等待链树</td><td>path 形式完整链；<code>-S</code> 追踪单会话向上链</td></tr>
+  <tr><td class="mono">detail -S</td><td>单会话时间线</td><td>逐样本明细 + seq# 停滞分析</td></tr>
+  <tr><td class="mono">obj</td><td>热点对象</td><td>current_obj# × 事件交叉</td></tr>
+  <tr><td class="mono">res</td><td>PGA / 临时段</td><td>按 SQL 峰值消耗（ORA-4030 / temp 撑爆入口）</td></tr>
+  <tr><td class="mono">text -q</td><td>SQL 文本</td><td>dba_hist_sqltext → v$sqlarea 兜底</td></tr>
+  <tr><td class="mono">all</td><td>一键复盘</td><td>范围 + 峰值 + 事件 + SQL + 会话 + 阻塞</td></tr>
+</table>
+<p>常用选项：<code>-t/-T 'YYYY-MM-DD HH24:MI:SS'</code> 时间窗 · <code>-m N</code> 最近 N 分钟 · <code>-g N</code> 实例过滤 · <code>-n N</code> 行数 · <code>-f FILE</code> 落盘 · <code>-p N</code> 并行 · <code>-w N</code> 跨实例容差秒 · <code>-x N</code> 长执行阈值 · <code>-D DBID</code> / <code>-C CON_ID</code>（19c CDB / 多库导入表） · <code>-objmap/-sqlmap/-usermap</code>（跨环境映射表）。</p>
+
+<h2><span class="no">04</span>核心方法论：六步下钻</h2>
+<div class="steps">
+  <div class="step" data-n="1"><h4>定位窗口</h4><div class="cmd">./ash_analyzer trend -t '2026-09-20 16:40:00' -T '2026-09-20 17:00:00'</div><p>活动会话突增段 = 问题起点（每分钟直方 + 峰值样本）。</p></div>
+  <div class="step" data-n="2"><h4>症状分类</h4><div class="cmd">./ash_analyzer events -t '2026-09-20 16:44:00' -T '2026-09-20 16:50:00'</div><p>顶级等待事件定性：CPU 饱和 / IO / 锁 / 集群。</p></div>
+  <div class="step" data-n="3"><h4>找根</h4><div class="cmd">./ash_analyzer blockers -t '2026-09-20 16:44:00' -T '2026-09-20 16:50:00'</div><p>Root Blocker = 等待树终点；<b>看它的 ROOT_EVT（它自己在等什么）</b>，那才是病灶。</p></div>
+  <div class="step" data-n="4"><h4>验证链路</h4><div class="cmd">./ash_analyzer chain -S 65 -t '2026-09-20 16:45:00' -T '2026-09-20 16:46:00'</div><p>从受害者到终点的完整 path，跨实例边按容差自动接上。</p></div>
+  <div class="step" data-n="5"><h4>卡死判定</h4><div class="cmd">./ash_analyzer detail -S 406 -t '2026-09-20 16:44:00' -T '2026-09-20 16:46:00'</div><p>seq# 不变 = 卡死在同一等待；seq# 递进 = 在走只是慢。</p></div>
+  <div class="step" data-n="6"><h4>补充维度</h4><div class="cmd">./ash_analyzer obj ... &nbsp;/&nbsp; res ... &nbsp;/&nbsp; text -q 9zg9qd9bm4spu</div><p>热点对象、PGA/临时段、SQL 文本。</p></div>
+</div>
+
+<h2><span class="no">05</span>阻塞链实现原理</h2>
+<p><b>向上遍历</b>：<code>connect by prior blocking_session = session_id</code>——子行是父行的持有者，从受害者走到链终点（<code>connect_by_isleaf=1</code>），根阻塞者即等待树终点。</p>
+<p><b>同实例边</b>：<code>prior sample_id = sample_id</code> 精确匹配。<b>跨实例边</b>：RAC 两实例采样网格存在相位差——96 环境实测 inst1/inst2 的 sample_id 序列完全独立、同秒采样零重叠，跨实例持有者在 ±2s 内命中 0、±5s 命中 154/155（99.4%）。因此跨实例改用时间容差：</p>
+<pre>( prior instance_number &lt;&gt; instance_number
+  and abs((cast(prior sample_time as date) - cast(sample_time as date))*86400) &lt;= 5 )   <span class="c">-- hist 默认 5s / gv 2s / -w 可调</span></pre>
+<p>配套防护：<code>prior blocking_inst_id = instance_number</code>（持有者实例对位）、serial# 匹配防 SID 重用、DBID 匹配防多库导入串库。</p>
+<div class="callout"><b>实测校准（96 / 2026-09-20 事故窗口）</b>155 条跨实例阻塞行：±2s 命中 0，±5s 命中 154（99.4%）；10 天 hist 全表阻塞树分析 0.5 秒完成。</div>
+
+<h2><span class="no">06</span>真实案例：2026-09-20 16:43–16:50 归档断档事故</h2>
+<div class="chainflow">
+<svg viewBox="0 0 860 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="阻塞链因果图">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5c6470"/>
+    </marker>
+  </defs>
+  <g font-family="-apple-system,'PingFang SC',sans-serif" font-size="13">
+    <!-- nodes -->
+    <g>
+      <rect x="10"  y="80" width="128" height="52" fill="#e8f1f7" stroke="#0f5c8c"/>
+      <text x="74"  y="100" text-anchor="middle" fill="#0f5c8c" font-weight="600">oracle_exporter</text>
+      <text x="74"  y="118" text-anchor="middle" fill="#5c6470" font-size="11">2.4 · library cache lock</text>
+
+      <rect x="185" y="80" width="128" height="52" fill="#e8f1f7" stroke="#0f5c8c"/>
+      <text x="249" y="100" text-anchor="middle" fill="#0f5c8c" font-weight="600">python run.py</text>
+      <text x="249" y="118" text-anchor="middle" fill="#5c6470" font-size="11">1.19 · buffer busy waits</text>
+
+      <rect x="360" y="80" width="140" height="52" fill="#fdf3e7" stroke="#8a4a0b"/>
+      <text x="430" y="100" text-anchor="middle" fill="#8a4a0b" font-weight="700">dbmotion 1.65</text>
+      <text x="430" y="118" text-anchor="middle" fill="#8a4a0b" font-size="11">log file switch (archiving)</text>
+
+      <rect x="547" y="80" width="130" height="52" fill="#fdf3e7" stroke="#8a4a0b"/>
+      <text x="612" y="100" text-anchor="middle" fill="#8a4a0b" font-weight="700">LGWR 1.406</text>
+      <text x="612" y="118" text-anchor="middle" fill="#8a4a0b" font-size="11">enq: CF / control file read</text>
+
+      <rect x="724" y="80" width="126" height="52" fill="#faecec" stroke="#a02c2c"/>
+      <text x="787" y="100" text-anchor="middle" fill="#a02c2c" font-weight="700">ARC1 1.317</text>
+      <text x="787" y="118" text-anchor="middle" fill="#a02c2c" font-size="11">control file seq read</text>
+    </g>
+    <!-- edges -->
+    <g stroke="#5c6470" stroke-width="1.6" marker-end="url(#arr)" fill="none">
+      <line x1="138" y1="106" x2="183" y2="106"/>
+      <line x1="313" y1="106" x2="358" y2="106"/>
+      <line x1="500" y1="106" x2="545" y2="106"/>
+      <line x1="677" y1="106" x2="722" y2="106"/>
+    </g>
+    <!-- annotations -->
+    <text x="430" y="30" text-anchor="middle" fill="#8a4a0b" font-weight="700" font-size="14">根阻塞者 #1：dbmotion — 链 230 · 受害者 14（ROOT_EVT = log file switch）</text>
+    <text x="612" y="52" text-anchor="middle" fill="#a02c2c" font-size="12.5">根阻塞者 #2：LGWR — control file I/O（18 受害者）→ 病灶：归档目的地写入慢 + 控制文件 I/O</text>
+    <text x="430" y="165" text-anchor="middle" fill="#5c6470" font-size="12">被阻塞方（等待者）← 每个箭头“指向”下一级持有者 · chain 命令的 path 即此方向</text>
+  </g>
+</svg>
+<div class="cap">tool 输出还原的完整等待链：2.4 → 1.19 → 1.65 → 1.406 → 1.317（跨实例边为容差匹配）</div>
+</div>
+<p>结论与当时现场一致：归档目的地写入慢导致 log file switch (archiving needed)，传导到 LGWR 控制文件竞争、再到业务等待。root_evt 列直接指向病灶层级。</p>
+
+<h2><span class="no">07</span>判读要点</h2>
+<ul>
+  <li><b>est_sec = 样本数 × 采样间隔</b>（hist 10s / gv 1s），近似 DB time 秒。</li>
+  <li><b>ON CPU 数接近物理 CPU 数</b> → 结合 OS 侧（run queue / OSWatcher）看，别只盯数据库。</li>
+  <li><b>root_evt 是真正病灶</b>：等待者表面事件（如 library cache lock）常只是传导症状。</li>
+  <li><b>seq# 不变</b> = 卡死同一等待（hang）；<b>seq# 递进</b> = 在走只是慢 / 循环等待。</li>
+  <li><b>iscycle=1</b> = 等待环（死锁类），重点排查。</li>
+  <li><b>STATUS=VALID 但持有者不在样本中</b> = 持有者空闲未被采样——ASH 机制固有限制，对照“直接阻塞者”表。</li>
+  <li><b>-g 实例过滤会切断跨实例等待链</b>，RAC 全局分析慎用。</li>
+  <li>导入表分析时 current_obj# / user_id 属于源库，需一并导入源库 dba_objects / dba_users 才能解析。</li>
+</ul>
+
+<h2><span class="no">08</span>验证矩阵与已知限制</h2>
+<table>
+  <tr><th>场景</th><th class="mono">状态</th></tr>
+  <tr><td>12.1 RAC hist（dba_hist_ash 双实例）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>12.1 RAC gv$（实时 1s）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>12.1 单实例 v$（lcbdg DG 备库）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>CTAS 全列导入表</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td><b>10.10.180.201 真 19c（panjf 非 CDB）+ 真实异环境 m_ash（112 列/4 节点源）</b></td><td class="mono"><span class="tag g">真机✓ 全流程</span></td></tr>
+  <tr><td>bequeath 试连 home 兑底（oratab 未登记实例；dumpable=0 下 /proc 不可用）</td><td class="mono"><span class="tag g">真机✓（panjf1）</span></td></tr>
+  <tr><td>多实例自动选库提示（201 六实例主机）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>-objmap/-sqlmap/-usermap 映射表解析</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>DBID 差异自动提示（异环境识别）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>conf 配置文件（conf 接管 + CLI 覆盖）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>列缺失降级（无 BLOCKING_INST_ID / PGA / SQL_EXEC_ID）</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>19c 超集列模拟（USECS_PER_ROW 等 19c 独有列）</td><td class="mono"><span class="tag g">模拟✓</span></td></tr>
+  <tr><td>跨实例阻塞链 ±5s 容差</td><td class="mono"><span class="tag g">真机✓ 99.4%</span></td></tr>
+  <tr><td>-s 多实例 / -f 落盘 / -p 并行 / -g / -D / -C</td><td class="mono"><span class="tag g">真机✓</span></td></tr>
+  <tr><td>qone2 部署</td><td class="mono"><span class="tag g">v1.1 已同步</span></td></tr>
+  <tr><td>11.2.0.4</td><td class="mono"><span class="tag">语法兼容（无 12c+ 特性）待环境实测</span></td></tr>
+</table>
+<p>已知限制：未被 ASH 采样的空闲持有者不进等待树（blockers 直接表可对照）；<code>ash.dmp</code>（19c 导出）在 12.1 无法 impdp（ORA-39142），需 19c 库导入后 <code>-i system.m_ash</code> 配映射表分析；库处于锁风暴时 DDL 类环境准备（CTAS 导入）会排队挂起。</p>
+
+<footer>
+  <span>ash_analyzer v1.2 · by AutoClaw for 飞扬</span>
+  <span>2026-09-22 · 验证环境：qone1/qone2 12.1 RAC · 10.10.180.201 19c</span>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,2028 @@
+#!/bin/bash
+#=====================================================================
+# ash_analyzer v1.3 -- Oracle ASH 历史性能 / 阻塞分析工具
+#                      (RAC + 单实例; 11.2.0.4 ~ 19c+)
+#
+# v1.3 (2026-09-30):
+#   - 命令分派 case 合并 text (修复 text 分支顺序依赖)
+#   - chain path 列 a40 -> a60 + rpad, 消除跨实例长链换行串行
+#   - events/all 事件列 a40 -> a35/a38, 消除 'flash cache' 折行串行
+#   - -p N 新增会话级并行 (alter session force parallel query)
+#   - connect by 边加固: 排除 BLOCKING_SESSION_STATUS='INVALID' 的历史行
+#     (同实例边强制 prior inst=inst, 语义更显式)
+#   - 新增 export 命令: 交互输入时间范围, 生成客户环境信息收集脚本
+#     (CTAS ash/对象/SQL文本/用户 四件套 + expdp 打包, 拷过去直接执行)
+#   - 新增 diag 命令: 生成客户侧自诊断脚本 (无法导 dmp / 无法远程时,
+#     客户输入视图名+时间窗, 本地跑六步法输出初步排查报告报告)
+#
+# 跨环境导入分析: -i 指定任意导入表/视图 (布局自动识别);
+#   -objmap/-sqlmap/-usermap 配套解析对象名/SQL文本/用户名;
+#   数据 DBID 与本地不一致时自动提示。
+#
+# 数据源 (自动识别布局, 或用 -i 指定):
+#   gv$active_session_history      RAC 全库, 内存, 1s 采样
+#   v$active_session_history       本实例, 内存, 1s 采样
+#   dba_hist_active_sess_history   AWR 持久化, 10s 采样
+#   任意 CTAS / impdp 导入的 ASH 表   布局按列自动识别
+#
+# 布局识别:
+#   有 INST_ID                   -> gv     (采样间隔 1s)
+#   有 SNAP_ID + INSTANCE_NUMBER -> hist   (采样间隔 10s)
+#   有 INSTANCE_NUMBER (无 SNAP_ID/DBID) -> hist + 提示
+#   都没有                       -> single
+# 可选列缺失自动降级 -> 11.2 / 12c / 19c 列集差异安全.
+#
+# 阻塞链 (connect by 向上走: 受害者 -> 持有者 -> ...):
+#   同实例边  : 精确样本匹配 (sample_id / sample_time)
+#   跨实例边  : 时间容差 (RAC 两实例采样网格相位差, 无法等值匹配;
+#               默认 hist 5s / gv 2s, -w 可调; 已在 12.1 RAC 实测标定)
+#
+# 时间口径: DB time ~= ASH 样本数 x 采样间隔
+#
+# 部署: 任意装有 bash + sqlplus 的 Oracle 服务器, 单文件, 无其他依赖
+# by AutoClaw for 飞扬, 2026-09-22
+#=====================================================================
+VERSION="1.5"
+
+#---------------------------------------------------------------------
+# defaults
+#---------------------------------------------------------------------
+TOPN=15
+MINS=""
+TBEG=""
+TEND=""
+VIEW_IN=""
+OBJMAP=""
+SQLMAP=""
+USERMAP=""
+PDB=""
+CONN=""
+SID_IN=""
+SPOOLF=""
+SESSID=""
+SQLID=""
+INSTF=""
+DBIDF=""
+CONF=""
+PDOP=""
+MINSAMP=6
+XTOL=""
+VERBOSE=0
+CMD=""
+
+RV_FULL=""        # 解析后的 owner.object
+RV_KIND=""        # gv | hist | single
+ICOL="1"          # 实例列表达式
+ICOLN="1"         # 实例列裸名 (single 时为常量 1)
+IV=1              # 采样间隔(秒, 估计)
+COLS=""           # 列清单(空格分隔)
+SMATCH=""         # 样本匹配表达式
+SMATCH_T=""       # 样本匹配表达式(to_char 形态)
+CRM=""            # connect_by_root(样本列)
+CRINST=""         # connect_by_root(实例列) 或 1
+CBSER=""          # serial# 匹配条件
+CB=""             # 完整 connect by 条件
+TW=""             # 时间窗口 where 片段
+TW_DESC=""
+PHINT=""          # 并行 hint 内容
+SQLBIN=""
+
+#---------------------------------------------------------------------
+# helpers
+#---------------------------------------------------------------------
+die() { echo "ERROR: $*" >&2; exit 1; }
+vmsg() { if [ "$VERBOSE" = "1" ]; then echo "-- $*" >&2; fi; }
+
+valid_ts()   { echo "$1" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'; }
+valid_int()  { echo "$1" | grep -qE '^[0-9]+$'; }
+valid_qual() { echo "$1" | grep -qE '^[A-Za-z][A-Za-z0-9_$#]*(\.[A-Za-z][A-Za-z0-9_$#]*)?$'; }
+valid_sqlid(){ echo "$1" | grep -qE '^[0-9a-z]{13}$'; }
+
+has_col() { case " $COLS " in *" $1 "*) return 0;; esac; return 1; }
+numcol()  { if has_col "$1"; then echo "$1"; else echo "to_number(null)"; fi; }
+strcol()  { if has_col "$1"; then echo "$1"; else echo "to_char(null)"; fi; }
+
+# 原始 SQL 执行 (字符串只做一次 shell 展开, 经管道喂给 sqlplus)
+qsql() {
+  {
+    if [ -n "$PDB" ]; then echo "alter session set container=\"$PDB\";"; fi
+    printf '%s\n' "$1"
+  } | "$SQLBIN" -S -L "$CONN"
+}
+
+#---------------------------------------------------------------------
+# usage
+#---------------------------------------------------------------------
+usage() {
+echo "ash_analyzer v$VERSION -- Oracle ASH 历史性能 / 阻塞分析工具"
+cat <<'U'
+               支持 RAC 与单实例; 11.2.0.4 ~ 19c; 内存视图 + AWR 历史 + 导入表
+
+用法:
+  ./ash_analyzer                  或  ./ash_analyzer help      # 本帮助 (总览)
+  ./ash_analyzer <命令> -help                                 # 命令级详细帮助
+  ./ash_analyzer <命令> [选项]                                  # 执行
+
+命令 (详细用法敲: ./ash_analyzer <命令> -help)
+  --- 分析命令 (在本机库上跑) ---
+  info       数据源体检: 布局识别/行数/时间范围/各实例分布/密度/采样断档
+  trend      活动会话趋势: 每分钟直方 + 峰值样本
+  events     顶级等待事件 (含 ON CPU) + 事件 x SQL 交叉
+  sql        SQL 排行 (按样本数) + 长执行识别 (sql_exec_id)
+  sessions   会话排行 (解析用户/程序/机器)
+  blockers   阻塞分析: 直接阻塞者 + 根阻塞者 Root Blocker (等待树)
+  chain      等待链树; 加 -S 追踪单会话的向上等待链
+  detail     单会话 ASH 时间线 + seq# 停滞分析 (-S 必填)
+  obj        热点对象 (current_obj#)
+  res        PGA / 临时表空间消耗 (按 SQL)
+  text       打印 SQL 文本 (text -q <sql_id>)
+  all        一键复盘报告 (范围+峰值+事件+SQL+会话+阻塞)
+  --- 生成命令 (产出脚本给客户环境用) ---
+  export     生成客户环境 ASH 信息收集脚本 (CTAS 四件套 + expdp 打包)
+  diag       生成客户侧自诊断脚本 (导不出 dmp / 无法远程时用)
+
+数据源 -i  [默认 hist]
+  gv / v / hist / 任意表名或视图名 (布局自动识别, 可带属主, 如 -i wfy.m_ash)
+
+通用速查 (全部选项见各命令的 -help):
+  -t/-T 窗口    -m N 最近N分钟    -i 数据源    -c 连接串    -s SID    -n TopN
+  -f 落盘       -v 打印SQL        -V 版本
+
+方法论 (MOS 经典六步的命令化):
+  info/trend 定位窗口 -> events 看症状 -> blockers 找根持有者
+  -> chain -S <root_sid> 看链路 -> detail -S 看 seq# 停滞 -> obj/res 补充
+
+配置文件 (可选): 脚本同目录 ash_analyzer.conf 预置默认值, CLI 参数优先.
+U
+}
+
+#---- 命令级帮助 -------------------------------------------------------
+usage_cmd() {
+  case "$1" in
+    info)
+cat <<'H'
+info -- 数据源体检
+  布局识别 (hist 10s / gv 1s / 单实例), 行数, 时间范围, 各实例分布,
+  每实例样本密度, 采样断档 (时间线上的空窗, 如 AWR flush 期间).
+  info 始终全表扫描, 不受 -m/-t/-T 过滤.
+用法: ./ash_analyzer info [-i 数据源] [-c 连接串] [-s SID] [-g N] [-D DBID]
+示例: ./ash_analyzer info
+      ./ash_analyzer info -i gv
+      ./ash_analyzer info -i wfy.m_ash_20260929 -s panjf1
+H
+      ;;
+    trend)
+cat <<'H'
+trend -- 活动会话趋势
+  每分钟会话数直方 (含 ON CPU), 峰值分钟与峰值时刻样本明细.
+  用来定位故障时间窗, 再用 -t/-T 精确分析.
+用法: ./ash_analyzer trend [-i 数据源] [-m N | -t .. -T ..] [-g N] [-n N]
+示例: ./ash_analyzer trend -m 120
+      ./ash_analyzer trend -t '2026-09-29 15:00:00' -T '2026-09-29 17:59:00'
+H
+      ;;
+    events)
+cat <<'H'
+events -- 顶级等待事件
+  按样本数排序的等待事件 (含 ON CPU), 附事件 x SQL 交叉表,
+  区分集群类等待 (gc *) 与单实例等待, 快速判断是集群扩散还是本地问题.
+用法: ./ash_analyzer events [-i 数据源] [窗口选项] [-g N] [-n N]
+示例: ./ash_analyzer events -t '2026-09-29 15:00:00' -T '2026-09-29 17:59:00'
+H
+      ;;
+    sql)
+cat <<'H'
+sql -- SQL 排行
+  按样本数排序的 SQL Top N, 识别长执行 (sql_exec_id 相同跨多采样点),
+  附 SQL 类型 (SELECT/PLSQL...) 与用户/模块.
+  -q <sql_id> 看单条: 配 text 命令取文本.
+用法: ./ash_analyzer sql [-i 数据源] [窗口选项] [-g N] [-n N] [-x N]
+  -x N    长执行判定阈值样本数 (默认 6)
+示例: ./ash_analyzer sql -m 60 -n 20
+H
+      ;;
+    sessions)
+cat <<'H'
+sessions -- 会话排行
+  按样本数排序的会话 Top N, 解析用户/程序/机器,
+  跨环境导入数据需配 -usermap (user_id 属于源库).
+用法: ./ash_analyzer sessions [-i 数据源] [窗口选项] [-g N] [-n N] [-usermap 表]
+示例: ./ash_analyzer sessions -m 60
+      ./ash_analyzer sessions -i system.t_ash -usermap system.t_users
+H
+      ;;
+    blockers)
+cat <<'H'
+blockers -- 阻塞分析 (直接阻塞者 + 根阻塞者)
+  Root Blocker 视角: 谁"持有资源不撒手"导致整棵等待树.
+  输出根阻塞者清单 (isleaf=1 的持有者) + 其 root_evt (它自己在等什么,
+  即真正的最终原因: 如 idle = 纯持有不干活, 如 enq HW = 它也是受害者).
+  每个根阻塞者给出其下受害树规模.
+  大窗口建议 -p N (强制并行, 1.1M 行 45 分钟窗约 2-4 分钟).
+用法: ./ash_analyzer blockers [-i 数据源] [窗口选项] [-g N] [-p N]
+示例: ./ash_analyzer blockers -t '2026-09-29 16:00:00' -T '2026-09-29 17:00:00' -p 4
+H
+      ;;
+    chain)
+cat <<'H'
+chain -- 等待链树
+  CONNECT BY 向上走 blocking_session, 还原"谁堵谁"的完整链条,
+  iscycle 标记环 (AB 互堵), 跨实例边 (gc 类等待) 有 5s 相位容差.
+  -S <sid> 只看一个会话的向上链路 (从受害者追到根).
+  大窗口建议 -p N. 注意: -g N 会切断跨实例等待链, 慎用.
+用法: ./ash_analyzer chain [-i 数据源] [窗口选项] [-S SID] [-g N] [-p N] [-w N]
+  -S SID  追踪单会话等待链
+  -w N    跨实例链匹配容差秒 (默认 hist=5 / gv=2)
+示例: ./ash_analyzer chain -S 12345 -m 30
+      ./ash_analyzer chain -t '2026-09-29 16:40:00' -T '2026-09-29 16:50:00'
+H
+      ;;
+    detail)
+cat <<'H'
+detail -- 单会话 ASH 时间线
+  一个会话逐采样点明细: 事件/p1p2/对象/SQL; seq# 长期不变 = 会话卡死
+  (区别于采样间隙). p1/p2 自动按事件解码 (HW: 表空间# 文件#/块#,
+  TX: usn/slot...).
+  注意: blocker 的 SID 是每实例编号, RAC 下可能要按实例分别 detail.
+用法: ./ash_analyzer detail -S SID [-i 数据源] [窗口选项] [-g N]
+示例: ./ash_analyzer detail -S 12345 -m 60
+H
+      ;;
+    obj)
+cat <<'H'
+obj -- 热点对象
+  按 current_obj# 统计热点表/索引; 跨环境导入数据 (obj# 属源库) 必须
+  配 -objmap (源库 dba_objects 的 CTAS 映射表), 否则只能看到裸 object_id.
+用法: ./ash_analyzer obj [-i 数据源] [窗口选项] [-objmap 表] [-n N]
+示例: ./ash_analyzer obj -i system.t_ash -objmap system.t_obj -t '..' -T '..'
+H
+      ;;
+    res)
+cat <<'H'
+res -- 资源消耗
+  按 SQL 统计 PGA / 临时表空间消耗 (TEMPSEG_SIZE/PGA_ALLOCATED_MEM),
+  定位排序/哈希/大数据量 SQL.
+用法: ./ash_analyzer res [-i 数据源] [窗口选项] [-g N] [-n N]
+示例: ./ash_analyzer res -m 60
+H
+      ;;
+    text)
+cat <<'H'
+text -- 打印 SQL 文本
+  跨环境导入数据 (SQL 文本属源库) 需配 -sqlmap, 否则只能显示 SQL_ID.
+用法: ./ash_analyzer text -q <sql_id> [-i 数据源] [-sqlmap 表]
+示例: ./ash_analyzer text -q 3ajt2htrmb83y
+      ./ash_analyzer text -q 3ajt2htrmb83y -sqlmap system.t_sqltext
+H
+      ;;
+    all)
+cat <<'H'
+all -- 一键复盘报告
+  依次跑: 窗口概览 + 峰值 + 事件 + SQL + 会话 + 阻塞, 汇总一份报告;
+  建议配 -f 落盘存档.
+用法: ./ash_analyzer all [-i 数据源] [窗口选项] [-n N] [-p N] [-f 文件]
+示例: ./ash_analyzer all -t '2026-09-29 15:00:00' -T '2026-09-29 17:59:00' -f rep.txt
+H
+      ;;
+    export)
+cat <<'H'
+export -- 生成客户环境信息收集脚本
+  场景: 能进客户库但要带数据回分析机 (导不出 dmp 也能收集).
+  生成一个自包含收集脚本, 拷到客户环境执行:
+    CTAS 四件套 (m_ash/m_obj/m_sqltext/m_users + m_snap) -> expdp 打包 dmp ->
+    清理临时表; 拿回 dmp impdp 后用 ./ash_analyzer info -i <owner>.m_ash_<tag> 分析.
+  生成的脚本 sh/bash 均可执行, 自带环境自举 (ORACLE_HOME 未设也能跑),
+  预校验临时表用户/directory 存在, 幂等可重跑.
+选项:
+  -t 'YYYY-MM-DD HH24:MI:SS'   窗口起点 (不给则交互输入)
+  -T 'YYYY-MM-DD HH24:MI:SS'   窗口终点 (不给则交互输入)
+  -o FILE    收集脚本落盘路径 (默认 /tmp/ash_collect_<tag>.sh)
+  -s SID     目标库 ORACLE_SID (多实例主机建议显式指定)
+  -c STR     客户库连接串 (默认 / as sysdba), 会写进生成的脚本
+  -g N       只收集实例 N (默认全部实例)
+  -d DIR     导出用 Oracle directory 名 (默认 DATA_PUMP_DIR)
+  -u USER    CTAS 临时表存放用户 (默认 system; 需有建表权限+配额,
+             以及 directory 读写权限: grant read,write on directory <DIR> to <USER>)
+示例: ./ash_analyzer export
+      ./ash_analyzer export -t '2026-10-01 10:00:00' -T '2026-10-01 11:00:00' \
+                             -o /tmp/ash_collect.sh -s orcl1 -u wfy -d EXP_DUMP
+H
+      ;;
+    diag)
+cat <<'H'
+diag -- 生成客户侧自诊断脚本
+  场景: 无法远程 / 导不出 dmp, 客户在自己环境跑初诊.
+  生成自包含诊断脚本 (不依赖 ash_analyzer), 客户执行时输入:
+    ASH 视图/表名 + 时间窗 (回车沿用上次, 记在 ash_diag_run.conf);
+  脚本自动识别布局, 按 MOS 六步法输出初步排查报告 diag_report_<tag>.txt.
+  输出简洁 (进度行 + 报告摘要), 可反复调整时间窗重跑.
+选项:
+  -t/-T      时间范围 (不给则由客户执行时交互输入)
+  -i VIEW    客户侧数据源 (默认 dba_hist_active_sess_history)
+  -o FILE    生成脚本落盘路径 (默认 /tmp/ash_diag_<tag>.sh)
+  -c STR     客户库连接串 (默认 / as sysdba)
+示例: ./ash_analyzer diag
+      ./ash_analyzer diag -t '2026-10-08 00:00:00' -T '2026-10-08 01:00:00'
+H
+      ;;
+    *)
+      echo "没有 '$1' 命令的单独帮助; 敲 ./ash_analyzer help 看总览." >&2
+      usage
+      ;;
+  esac
+}
+
+#---------------------------------------------------------------------
+# 可选配置文件: 脚本同目录 ash_analyzer.conf (KEY=*** CLI 参数优先)
+#   可预置: VIEW_IN / CONN / TOPN / MINS / SPOOLF / PDOP / VERBOSE
+#---------------------------------------------------------------------
+CONF_FILE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/ash_analyzer.conf"
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+
+#---------------------------------------------------------------------
+# 参数解析
+#---------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    info|trend|events|sql|sessions|blockers|chain|detail|obj|res|all|text|export|diag)
+         CMD="$1"; shift ;;
+    help) usage; exit 0 ;;
+    -V|--version) echo "ash_analyzer v$VERSION"; exit 0 ;;
+    -help|-h|--help) [ -n "$CMD" ] && { usage_cmd "$CMD"; exit 0; }; usage; exit 0 ;;
+    -t) TBEG="$2"; shift 2 ;;
+    -T) TEND="$2"; shift 2 ;;
+    -m) MINS="$2"; shift 2 ;;
+    -i) VIEW_IN="$2"; shift 2 ;;
+    -objmap) OBJMAP="$2"; shift 2 ;;
+    -sqlmap) SQLMAP="$2"; shift 2 ;;
+    -usermap) USERMAP="$2"; shift 2 ;;
+    -pdb) PDB="$2"; shift 2 ;;
+    -c) CONN="$2"; shift 2 ;;
+    -s) SID_IN="$2"; shift 2 ;;
+    -n) TOPN="$2"; shift 2 ;;
+    -g) INSTF="$2"; shift 2 ;;
+    -D) DBIDF="$2"; shift 2 ;;
+    -C) CONF="$2"; shift 2 ;;
+    -f) SPOOLF="$2"; shift 2 ;;
+    -p) PDOP="$2"; shift 2 ;;
+    -x) MINSAMP="$2"; shift 2 ;;
+    -w) XTOL="$2"; shift 2 ;;
+    -S) SESSID="$2"; shift 2 ;;
+    -q) SQLID="$2"; shift 2 ;;
+    -o) OUTF="$2"; shift 2 ;;
+    -d) DPDIR="$2"; shift 2 ;;
+    -u) TOWNER="$2"; shift 2 ;;
+    -v) VERBOSE=1; shift ;;
+    *) if [ "$CMD" = "text" ] && [ -z "$SQLID" ] && valid_sqlid "$1"; then
+         SQLID="$1"; shift
+       else
+         echo "未知参数: $1" >&2; usage; exit 1
+       fi ;;
+  esac
+done
+
+[ -z "$CMD" ] && { usage; exit 1; }
+
+[ -n "$TBEG" ] && { valid_ts "$TBEG"  || die "-t 需要 'YYYY-MM-DD HH24:MI:SS'"; }
+[ -n "$TEND" ] && { valid_ts "$TEND"  || die "-T 需要 'YYYY-MM-DD HH24:MI:SS'"; }
+[ -n "$OUTF"  ] && case "$CMD" in export|diag) : ;; *) die "-o 仅 export/diag 命令使用" ;; esac
+[ -n "$MINS" ] && { valid_int "$MINS" || die "-m 需要数字"; }
+valid_int "$TOPN"    || die "-n 需要数字"
+valid_int "$MINSAMP" || die "-x 需要数字"
+[ -n "$INSTF"  ] && { valid_int "$INSTF"  || die "-g 需要数字"; }
+[ -n "$DBIDF"  ] && { valid_int "$DBIDF"  || die "-D 需要数字"; }
+[ -n "$CONF"   ] && { valid_int "$CONF"   || die "-C 需要数字"; }
+[ -n "$PDOP"   ] && { valid_int "$PDOP"   || die "-p 需要数字"; }
+[ -n "$XTOL"   ] && { valid_int "$XTOL"   || die "-w 需要数字"; }
+[ -n "$SESSID" ] && { valid_int "$SESSID" || die "-S 需要会话号"; }
+[ -n "$SQLID"  ] && { valid_sqlid "$SQLID" || die "-q 需要 13 位 sql_id"; }
+[ -n "$PDB"   ] && { valid_qual "$PDB"   || die "-pdb 需要合法容器名"; }
+[ "$CMD" = "detail" ] && [ -z "$SESSID" ] && die "detail 必须带 -S <session_id>"
+[ "$CMD" = "text"   ] && [ -z "$SQLID"  ] && die "text 用法: text -q <sql_id>"
+
+if [ -n "$SPOOLF" ]; then
+  exec > >(tee "$SPOOLF") 2>&1
+fi
+
+#---------------------------------------------------------------------
+# 环境探测: sqlplus / ORACLE_HOME / ORACLE_SID
+#---------------------------------------------------------------------
+find_env() {
+  local cand sid base h
+  sid="$SID_IN"
+  [ -z "$sid" ] && [ -n "$ORACLE_SID" ] && sid="$ORACLE_SID"
+  if [ -z "$sid" ]; then
+    sid=$(ps -ef 2>/dev/null | grep 'ora_pmon_' | grep -v grep | sed 's/.*ora_pmon_//' | grep -v '^[+-]' | grep -E '^[A-Za-z][A-Za-z0-9_$#]*$' | head -1)
+  fi
+  if [ -z "$sid" ]; then
+    sid=$(awk -F: '/^[^#+-]/ && $1!="" {print $1; exit}' /etc/oratab 2>/dev/null)
+  fi
+  h=""
+  if [ -n "$sid" ]; then
+    h=$(awk -F: -v s="$sid" '$1==s {print $2; exit}' /etc/oratab 2>/dev/null)
+    if [ -z "$h" ]; then
+      base=$(echo "$sid" | sed 's/[0-9]*$//')
+      [ -n "$base" ] && h=$(awk -F: -v b="$base" '$1==b {print $2; exit}' /etc/oratab 2>/dev/null)
+    fi
+  fi
+  # 兜底: oratab 未登记的实例无法用 /proc 反推 (oracle 进程 dumpable=0),
+  # 改用 bequeath 试连: 逐个候选 home 用 / as sysdba 连接, 能查通的那个即实例 home
+  if [ -z "$h" ] && [ -n "$sid" ]; then
+    HOMES=""
+    for hh in $(awk -F: '/^[^#+-]/ && $2!="" {print $2}' /etc/oratab 2>/dev/null | sort -u); do
+      [ -x "$hh/bin/sqlplus" ] && HOMES="$HOMES $hh"
+    done
+    for cand in /opt/oracle/product/*/dbhome_* /u01/app/oracle/product/*/dbhome_* \
+                /opt/oracle/products/*/dbhome_* /u01/app/oracle/product/*/*.*.* \
+                /opt/ora*/*/dbhome_*; do
+      [ -x "$cand/bin/sqlplus" ] || continue
+      case " $HOMES " in *" $cand "*) ;; *) HOMES="$HOMES $cand";; esac
+    done
+    TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 20"
+    for hh in $HOMES; do
+      tst=$(ORACLE_HOME="$hh" ORACLE_SID="$sid" PATH="$hh/bin:/usr/bin:/bin" $TO "$hh/bin/sqlplus" -S -L '/ as sysdba' <<'TE' 2>/dev/null
+set heading off feedback off pages 0
+select 'ASH_HOME_OK' from dual;
+exit
+TE
+)
+      case "$tst" in *ASH_HOME_OK*) h="$hh"; vmsg "env: home by bequeath probe -> $h"; break ;; esac
+    done
+  fi
+  # 多实例主机提示 (自动选库时)
+  if [ -z "$SID_IN" ] && [ -z "${ORACLE_SID:-}" ]; then
+    cands=$(ps -ef 2>/dev/null | grep 'ora_pmon_' | grep -v grep | sed 's/.*ora_pmon_//' | grep -v '^[+-]' | grep -E '^[A-Za-z][A-Za-z0-9_$#]*$' | tr '\n' ' ')
+    cn=$(echo $cands | wc -w | tr -d ' ')
+    if [ "$cn" -gt 1 ]; then
+      echo "-- 注意: 本机有多个实例 [$cands], 自动选用 SID=$sid; 如非目标库请用 -s 指定" >&2
+    fi
+  fi
+  if [ -n "$h" ] && [ -x "$h/bin/sqlplus" ]; then
+    export ORACLE_HOME="$h"; export ORACLE_SID="$sid"
+    SQLBIN="$h/bin/sqlplus"
+    vmsg "env: ORACLE_HOME=$h ORACLE_SID=$sid (oratab)"
+    return
+  fi
+  if [ -n "$ORACLE_HOME" ] && [ -x "$ORACLE_HOME/bin/sqlplus" ]; then
+    SQLBIN="$ORACLE_HOME/bin/sqlplus"
+    vmsg "env: sqlplus <- ORACLE_HOME"
+    return
+  fi
+  if command -v sqlplus >/dev/null 2>&1; then
+    SQLBIN=$(command -v sqlplus)
+    vmsg "env: sqlplus <- PATH"
+    return
+  fi
+  for cand in /opt/oracle/product/*/dbhome_* /u01/app/oracle/product/*/dbhome_* \
+              /opt/oracle/products/*/dbhome_* /u01/app/oracle/product/*/*.*.* \
+              /opt/ora*/*/dbhome_*; do
+    if [ -x "$cand/bin/sqlplus" ]; then
+      export ORACLE_HOME="$cand"
+      [ -n "$sid" ] && export ORACLE_SID="$sid"
+      SQLBIN="$cand/bin/sqlplus"
+      vmsg "env: sqlplus <- 扫描 $cand"
+      return
+    fi
+  done
+  if [ "$CMD" = "export" ] || [ "$CMD" = "diag" ]; then
+    vmsg "env: export/diag 模式跳过 sqlplus 探测 (仅生成脚本)"
+    return 0
+  fi
+  die "找不到 sqlplus; 请设置 ORACLE_HOME 或用 -s SID"
+}
+
+if [ "$CMD" = "export" ] || [ "$CMD" = "diag" ]; then
+  # export/diag 只生成脚本, 不需要实际连接数据库
+  SKIP_CONN=1
+else
+  SKIP_CONN=0
+fi
+find_env
+
+if [ -z "$CONN" ]; then
+  CONN="/ as sysdba"
+  [ -n "$SID_IN" ] && export ORACLE_SID="$SID_IN"
+fi
+
+if [ "$SKIP_CONN" = "0" ]; then
+  CHK=$(qsql "set heading off feedback off pages 0
+select 'ASHANALYZER_CONN_OK' from dual;
+exit")
+  echo "$CHK" | grep -q 'ASHANALYZER_CONN_OK' || die "无法连接 [$CONN]: $CHK"
+fi
+
+#---------------------------------------------------------------------
+# 通用表解析 (schema.前缀 / 同义词兜底) → LK_FULL / LK_COLS
+#---------------------------------------------------------------------
+lookup_table() {
+  local v="$1" res vowner vtab
+  vowner=""; vtab="$v"
+  case "$v" in *.*) vowner="${v%%.*}"; vtab="${v##*.}";; esac
+  # 1) 直接按名找 (owner 优先级: 指定 > 当前schema > SYS > 其他)
+  res=$(qsql "set heading off feedback off pages 0 verify off define off
+select nm from (
+  select c.owner||'.'||c.table_name nm,
+         row_number() over (order by
+            case when c.owner = upper('$vowner') then 0
+                 when c.owner = sys_context('USERENV','SESSION_SCHEMA') then 1
+                 when c.owner = 'SYS' then 2 else 3 end, c.owner) rn
+  from all_tab_columns c
+  where c.table_name in ( upper('$vtab'),
+        replace(upper('$vtab'),'GV\$','GV_\$'),
+        replace(upper('$vtab'),'V\$','V_\$') )
+  group by c.owner, c.table_name
+) where rn = 1;
+exit")
+  # 2) 兜底: 同义词解析 (gv$/v$/dba_ 系列)
+  if [ -z "$res" ] || echo "$res" | grep -q 'ORA-'; then
+    res=$(qsql "set heading off feedback off pages 0 verify off define off
+select nm from (
+  select s.table_owner||'.'||s.table_name nm,
+         row_number() over (order by case when s.owner='PUBLIC' then 0 else 1 end) rn
+  from all_synonyms s
+  where s.synonym_name = upper('$vtab')
+) where rn = 1;
+exit")
+  fi
+  echo "$res" | grep -q 'ORA-' && return 1
+  LK_FULL=$(echo "$res" | head -1 | tr -d ' ')
+  [ -z "$LK_FULL" ] && return 1
+  LK_COLS=$(qsql "set heading off feedback off pages 0 verify off define off
+select column_name from all_tab_columns
+where owner||'.'||table_name = '$LK_FULL'
+order by column_id;
+exit")
+  echo "$LK_COLS" | grep -q 'ORA-' && return 1
+  LK_COLS=$(echo "$LK_COLS" | grep -v '^[[:space:]]*$' | tr '\n' ' ' | sed 's/  */ /g')
+  return 0
+}
+
+resolve_view() {
+  local v="$1" chk
+  case "$v" in
+    "")          v="dba_hist_active_sess_history" ;;
+    gv|gash)     v="gv\$active_session_history" ;;
+    v|ash)       v="v\$active_session_history" ;;
+    hist|h|awr)  v="dba_hist_active_sess_history" ;;
+  esac
+  valid_qual "$v" || die "非法视图/表名: $v (含 \$ 请加引号或用 gv/v 简写)"
+  lookup_table "$v" || die "找不到 [$v]: 检查名字/属主/权限 (需要 SELECT DICTIONARY)"
+  RV_FULL="$LK_FULL"
+  COLS="$LK_COLS"
+
+  for c in SAMPLE_TIME SESSION_ID SESSION_SERIAL# EVENT SESSION_STATE SQL_ID PROGRAM MACHINE; do
+    has_col "$c" || die "[$v] 缺少必需列 $c -- 不是可分析的 ASH 结构数据源"
+  done
+
+  if has_col INST_ID; then
+    RV_KIND=gv;     ICOL="inst_id";         ICOLN="inst_id";         IV=1
+  elif has_col SNAP_ID; then
+    has_col INSTANCE_NUMBER || die "[$v] 有 SNAP_ID 但无 INSTANCE_NUMBER"
+    RV_KIND=hist;   ICOL="instance_number"; ICOLN="instance_number"; IV=10
+  elif has_col INSTANCE_NUMBER && has_col DBID; then
+    # 常见 CTAS 导入形态: 从 dba_hist_ash 导入 (去掉 snap_id 但保留 instance_number/dbid)
+    RV_KIND=hist;   ICOL="instance_number"; ICOLN="instance_number"; IV=10
+  elif has_col INSTANCE_NUMBER; then
+    # 有实例列但无 snap_id/dbid: 无法确定采样间隔, 默认 hist(10s) 并提示
+    RV_KIND=hist;   ICOL="instance_number"; ICOLN="instance_number"; IV=10
+    echo "-- 提示: 检测到 INSTANCE_NUMBER 但无 SNAP_ID/DBID, 按 hist(10s) 处理;"
+    echo "--        若源是 1s 采样表, -w 容差和 est_sec 请按 1s 口径解读."
+  else
+    RV_KIND=single; ICOL="1";               ICOLN="1";               IV=1
+  fi
+
+  if has_col SAMPLE_ID; then
+    SMATCH="sample_id"; SMATCH_T="to_char(sample_id)"
+    CRM="connect_by_root(sample_id)"
+  else
+    SMATCH="to_char(sample_time,'YYYY-MM-DD HH24:MI:SS.FF3')"
+    SMATCH_T="$SMATCH"
+    CRM="connect_by_root(sample_time)"
+  fi
+
+  if [ "$RV_KIND" = "single" ]; then CRINST="1"; else CRINST="connect_by_root($ICOLN)"; fi
+
+  if has_col BLOCKING_SESSION_SERIAL#; then
+    CBSER="prior blocking_session_serial# = session_serial#"
+  else
+    CBSER=""
+  fi
+
+  if [ -z "$XTOL" ]; then
+    if [ "$RV_KIND" = "hist" ]; then XTOL=5; else XTOL=2; fi
+  fi
+
+  [ -n "$DBIDF" ] && { has_col DBID   || die "[-D] 该数据源无 DBID 列"; }
+  [ -n "$CONF"  ] && { has_col CON_ID || die "[-C] 该数据源无 CON_ID 列"; }
+
+  chk=$(qsql "set heading off feedback off pages 0
+select 'OK' from $RV_FULL where rownum <= 1;
+exit")
+  echo "$chk" | grep -q 'ORA-' && die "无法查询 $RV_FULL: $chk"
+}
+if [ "$CMD" = "export" ] || [ "$CMD" = "diag" ]; then
+  vmsg "export/diag 模式: 跳过数据源解析与映射表校验 (不连库)"
+else
+  resolve_view "$VIEW_IN"
+fi
+
+#---------------------------------------------------------------------
+# 跨环境导入: 配套映射表 (-objmap/-sqlmap/-usermap) 与 DBID 比对
+#---------------------------------------------------------------------
+OBJTBL="dba_objects"; OBJTYPE_EXPR="o.object_type"
+SQLTBL="dba_hist_sqltext"; SQLTEXT_EXPR="sql_text"; SQLMAP_COLS=""
+UTBL="dba_users"
+CROSS_ENV=0
+
+# 字典表默认值自适应: 无 dba 权限的用户 (如 wfy) 降级 all_objects/all_users
+adaptive_dict() {
+  if [ -z "$OBJMAP" ]; then
+    t1=$(qsql "set heading off feedback off pages 0
+select 'OK' from dba_objects where rownum <= 1;
+exit" 2>/dev/null)
+    case "$t1" in *OK*) : ;; *)
+      t2=$(qsql "set heading off feedback off pages 0
+select 'OK' from all_objects where rownum <= 1;
+exit" 2>/dev/null)
+      case "$t2" in *OK*)
+        OBJTBL="all_objects"; echo "-- 提示: 无 dba_objects 权限, 对象解析改用 all_objects(仅可见对象)" ;;
+      esac ;;
+    esac
+  fi
+  if [ -z "$USERMAP" ]; then
+    t1=$(qsql "set heading off feedback off pages 0
+select 'OK' from dba_users where rownum <= 1;
+exit" 2>/dev/null)
+    case "$t1" in *OK*) : ;; *)
+      t2=$(qsql "set heading off feedback off pages 0
+select 'OK' from all_users where rownum <= 1;
+exit" 2>/dev/null)
+      case "$t2" in *OK*)
+        UTBL="all_users"; echo "-- 提示: 无 dba_users 权限, 用户名解析改用 all_users" ;;
+      esac ;;
+    esac
+  fi
+}
+
+validate_maps() {
+  if [ -n "$OBJMAP" ]; then
+    valid_qual "$OBJMAP" || die "非法 -objmap 表名: $OBJMAP"
+    lookup_table "$OBJMAP" || die "找不到 -objmap 表 [$OBJMAP]"
+    OBJTBL="$LK_FULL"
+    for c in OBJECT_ID OWNER OBJECT_NAME; do
+      case " $LK_COLS " in *" $c "*) ;; *) die "-objmap [$OBJMAP] 缺少列 $c (需 OBJECT_ID/OWNER/OBJECT_NAME[,OBJECT_TYPE])";; esac
+    done
+    case " $LK_COLS " in
+      *" OBJECT_TYPE "*) OBJTYPE_EXPR="o.object_type" ;;
+      *) OBJTYPE_EXPR="to_char(null)" ;;
+    esac
+    echo "-- objmap : 对象名解析 <- $OBJTBL"
+  fi
+  if [ -n "$SQLMAP" ]; then
+    valid_qual "$SQLMAP" || die "非法 -sqlmap 表名: $SQLMAP"
+    lookup_table "$SQLMAP" || die "找不到 -sqlmap 表 [$SQLMAP]"
+    SQLTBL="$LK_FULL"; SQLMAP_COLS="$LK_COLS"
+    case " $LK_COLS " in *" SQL_ID "*) ;; *) die "-sqlmap [$SQLMAP] 缺少列 SQL_ID";; esac
+    case " $LK_COLS " in
+      *" SQL_TEXT "*)     SQLTEXT_EXPR="sql_text" ;;
+      *" SQL_FULLTEXT "*) SQLTEXT_EXPR="sql_fulltext" ;;
+      *) die "-sqlmap [$SQLMAP] 缺少 SQL_TEXT / SQL_FULLTEXT 列" ;;
+    esac
+    echo "-- sqlmap : SQL 文本   <- $SQLTBL"
+  fi
+  if [ -n "$USERMAP" ]; then
+    valid_qual "$USERMAP" || die "非法 -usermap 表名: $USERMAP"
+    lookup_table "$USERMAP" || die "找不到 -usermap 表 [$USERMAP]"
+    UTBL="$LK_FULL"
+    for c in USER_ID USERNAME; do
+      case " $LK_COLS " in *" $c "*) ;; *) die "-usermap [$USERMAP] 缺少列 $c (需 USER_ID/USERNAME)";; esac
+    done
+    echo "-- usermap: 用户名解析 <- $UTBL"
+  fi
+  if [ -n "$OBJMAP" ]; then
+    c1=$(qsql "set heading off feedback off pages 0
+select 'OK' from $OBJTBL where rownum <= 1;
+exit")
+    echo "$c1" | grep -q 'ORA-' && die "-objmap 表无法查询 [$OBJTBL]: $c1"
+  fi
+  if [ -n "$SQLMAP" ]; then
+    c1=$(qsql "set heading off feedback off pages 0
+select 'OK' from $SQLTBL where rownum <= 1;
+exit")
+    echo "$c1" | grep -q 'ORA-' && die "-sqlmap 表无法查询 [$SQLTBL]: $c1"
+  fi
+  if [ -n "$USERMAP" ]; then
+    c1=$(qsql "set heading off feedback off pages 0
+select 'OK' from $UTBL where rownum <= 1;
+exit")
+    echo "$c1" | grep -q 'ORA-' && die "-usermap 表无法查询 [$UTBL]: $c1"
+  fi
+}
+
+# DBID 比对: 数据源 DBID 不含本地库 dbid => 异环境导入
+check_cross_env() {
+  has_col DBID || return 0
+  local ldb sr
+  ldb=$(qsql "set heading off feedback off pages 0
+select to_char(dbid) from v\$database;
+exit" 2>/dev/null | head -1 | tr -d ' ')
+  sr=$(qsql "set heading off feedback off pages 0
+select distinct to_char(dbid) from $RV_FULL;
+exit" | grep -v '^[[:space:]]*$' | tr '\n' ' ')
+  case " $sr " in *" $ldb "*) CROSS_ENV=0 ;; *) CROSS_ENV=1 ;; esac
+}
+
+if [ "$CMD" != "export" ] && [ "$CMD" != "diag" ]; then
+  validate_maps
+  adaptive_dict
+  # 标准源 (未用 -i 或用简写) 免检; 自定义表才比对 DBID
+  if [ -n "$VIEW_IN" ] && [ "$VIEW_IN" != "hist" ] && [ "$VIEW_IN" != "gv" ] \
+     && [ "$VIEW_IN" != "v" ] && [ "$VIEW_IN" != "h" ] && [ "$VIEW_IN" != "awr" ] \
+     && [ "$VIEW_IN" != "ash" ]; then
+    check_cross_env
+  fi
+fi
+
+PHINT=""
+[ -n "$PDOP" ] && PHINT=" parallel($PDOP)"
+# 会话级并行 for connect by 重查询 (Oracle 11.2+ 都支持)
+PSES=""
+[ -n "$PDOP" ] && PSES="alter session force parallel query parallel $PDOP;"
+
+#---------------------------------------------------------------------
+# 时间窗口
+#---------------------------------------------------------------------
+build_tw() {
+  TW=""
+  if [ -n "$MINS" ]; then
+    TW="sample_time >= systimestamp - numtodsinterval($MINS,'minute')"
+    TW_DESC="最近 $MINS 分钟"
+  elif [ -n "$TBEG" ]; then
+    TW="sample_time >= to_timestamp('$TBEG','YYYY-MM-DD HH24:MI:SS')"
+    TW_DESC="$TBEG"
+    if [ -n "$TEND" ]; then
+      TW="$TW and sample_time <= to_timestamp('$TEND','YYYY-MM-DD HH24:MI:SS')"
+      TW_DESC="$TBEG ~ $TEND"
+    fi
+  else
+    MINS=60
+    TW="sample_time >= systimestamp - numtodsinterval(60,'minute')"
+    TW_DESC="最近 60 分钟 (默认; -m/-t/-T 调整)"
+  fi
+  [ -n "$INSTF" ] && TW="$TW and $ICOL = $INSTF"
+  [ -n "$DBIDF" ] && TW="$TW and dbid = $DBIDF"
+  [ -n "$CONF"  ] && TW="$TW and con_id = $CONF"
+}
+
+#---------------------------------------------------------------------
+# connect by 条件 (向上: 子行 = 父行的持有者)
+#   同实例: 样本精确匹配
+#   跨实例: blocking_inst_id 指向 + 时间容差 (相位差实测标定)
+#---------------------------------------------------------------------
+build_cb() {
+  local c1="prior blocking_session = session_id"
+  [ -n "$CBSER" ] && c1="$c1
+        and $CBSER"
+  # 同实例边要求持有者实例 = 等待者实例, 排除跨实例误配;
+  # BLOCKING_SESSION_STATUS=INVALID(会话已消失) 的历史行不可作为链边
+  local cself="prior $ICOLN = $ICOLN"
+  local bstat=""
+  has_col BLOCKING_SESSION_STATUS && bstat=" and nvl(prior blocking_session_status,'VALID') <> 'INVALID'"
+  if [ "$RV_KIND" != "single" ] && has_col BLOCKING_INST_ID; then
+    CB="$c1$bstat
+        and nvl(nullif(prior blocking_inst_id,0), prior $ICOLN) = $ICOLN
+        and (
+              ( $cself
+                and prior $SMATCH = $SMATCH )
+              or
+              ( prior $ICOLN <> $ICOLN
+                and abs((cast(prior sample_time as date) - cast(sample_time as date)) * 86400) <= $XTOL )
+            )"
+  else
+    if [ "$RV_KIND" = "single" ]; then
+      CB="$c1$bstat
+        and prior $SMATCH = $SMATCH"
+    else
+      CB="$c1$bstat
+        and $cself
+        and prior $SMATCH = $SMATCH"
+      echo "-- 注意: 数据源无 BLOCKING_INST_ID 列, 跨实例等待链不可用(仅同实例匹配)"
+    fi
+  fi
+  has_col DBID && CB="$CB
+        and prior dbid = dbid"
+}
+
+#---------------------------------------------------------------------
+# 输出
+#---------------------------------------------------------------------
+INSTDSP="$ICOLN"
+[ "$RV_KIND" = "single" ] && INSTDSP="(单实例)"
+
+# path 元素: 单实例只列 sid; RAC/hist 带 实例.sid 前缀(跨实例链可读)
+PELEM="$ICOLN||'.'||session_id"
+[ "$RV_KIND" = "single" ] && PELEM="session_id"
+
+banner() {
+  echo "==================================================================="
+  echo " ash_analyzer v$VERSION | 命令: $CMD"
+  echo " 连接   : SID=${ORACLE_SID:-(remote)}${PDB:+ PDB=$PDB}  数据源: $RV_FULL"
+  echo " 布局   : $RV_KIND [间隔=${IV}s 实例列=$INSTDSP]"
+  echo " 窗口   : $TW_DESC"
+  echo " 实例   : ${INSTF:-全部}  TopN: $TOPN  跨实例容差: ${XTOL}s"
+  echo "==================================================================="
+}
+hdr() { echo; echo "=== $* ==="; }
+
+run_sql() {
+  if [ "$VERBOSE" = "1" ]; then
+    echo "----- SQL -----" >&2; printf '%s\n' "$1" >&2; echo "----- /SQL -----" >&2
+  fi
+  {
+    echo "set linesize 300 pagesize 1000 trimspool on verify off feedback off echo off define off"
+    echo "alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';"
+    echo "alter session set nls_timestamp_format='YYYY-MM-DD HH24:MI:SS.FF3';"
+    if [ -n "$PDB" ]; then echo "alter session set container=\"$PDB\";"; fi
+    [ -n "$PSES" ] && printf '%s\n' "$PSES"
+    printf '%s\n' "$1"
+    echo "exit"
+  } | "$SQLBIN" -S -L "$CONN"
+}
+
+#=====================================================================
+# info -- 数据源体检
+#=====================================================================
+cmd_info() {
+  TW_DESC="全表扫描 (info 不做窗口过滤)"
+  banner
+  hdr "数据源对象"
+  run_sql "col owner format a14
+col object_name format a40
+col object_type format a14
+select owner, object_name, object_type from all_objects
+where owner||'.'||object_name = '$RV_FULL' and rownum = 1;"
+
+  echo " 布局     : $RV_KIND  (实例列: $INSTDSP, 采样间隔: ${IV}s)"
+  echo " 列数     : $(echo $COLS | wc -w | tr -d ' ')"
+
+  hdr "总行数 / 时间范围 (全表)"
+  run_sql "select count(*) total_rows,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') earliest,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') latest
+from $RV_FULL;"
+
+  hdr "各实例分布"
+  run_sql "col inst format 9999 heading 'INST'
+select $ICOL inst, count(*) rows_,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI') first_sample,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI') last_sample
+from $RV_FULL
+group by $ICOLN
+order by 1;"
+
+  if has_col DBID; then
+    hdr "DBID 分布 (-D 可锁定)"
+    run_sql "select dbid, count(*) rows_,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI') mn,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI') mx
+from $RV_FULL group by dbid order by 2 desc;"
+  fi
+
+  if [ "$CROSS_ENV" = "1" ]; then
+    hdr "跨环境提示"
+    echo " 该表 DBID 与本地库不一致 => 异环境导入的 ASH 数据。"
+    echo " current_obj# / user_id / SQL 文本均属源库, 解析需配套映射表:"
+    echo "   obj      ... -objmap  <导入的 dba_objects 表>"
+    echo "   text     ... -sqlmap  <导入的 sqltext 表>"
+    echo "   sessions ... -usermap <导入的 users 表>"
+  fi
+
+  if has_col CON_ID; then
+    hdr "CON_ID 分布 (-C 可锁定; 1=CDB根 2=SEED >2=PDB)"
+    run_sql "select con_id, count(*) rows_ from $RV_FULL group by con_id order by 1;"
+  fi
+
+  hdr "活跃密度: 最密集的 24 个小时"
+  run_sql "col hh format a16
+select * from (
+select to_char(trunc(sample_time,'hh'),'YYYY-MM-DD HH24') hh, count(*) rows_per_hour
+from $RV_FULL
+group by trunc(sample_time,'hh')
+order by rows_per_hour desc
+) where rownum <= 24;"
+
+  hdr "采样断档 (> $((IV * 3))s, 按实例)"
+  run_sql "col inst format 9999 heading 'INST'
+col gap_s format 999999 heading 'GAP_S'
+select * from (
+select $ICOL inst, to_char(prev_t,'YYYY-MM-DD HH24:MI:SS') gap_from,
+to_char(cur_t,'YYYY-MM-DD HH24:MI:SS') gap_to, gap_s
+from (
+  select $ICOLN, prev_t, cur_t,
+         round((cast(cur_t as date) - cast(prev_t as date)) * 86400) gap_s
+  from (
+    select $ICOLN, lag(sample_time) over (partition by $ICOLN order by sample_time) prev_t,
+           sample_time cur_t
+    from (select distinct $ICOLN, sample_time from $RV_FULL)
+  )
+)
+where gap_s > $((IV * 3)) and gap_s < 86400
+order by 1, 2
+) where rownum <= 200;"
+
+  echo
+  echo "-- 断档 = 实例宕机 / ASH 缓冲被冲刷 / 数据被清理; 下钻前先钉住窗口."
+}
+
+#=====================================================================
+# trend
+#=====================================================================
+cmd_trend() {
+  banner
+  hdr "每分钟活动会话数"
+  run_sql "col ts format a17
+col act format 99999 heading 'ACTIVE'
+select $ICOL inst, to_char(trunc(sample_time,'mi'),'YYYY-MM-DD HH24:MI') ts, count(*) act
+from $RV_FULL
+where $TW
+group by $ICOLN, trunc(sample_time,'mi')
+order by 1, 2;"
+
+  hdr "峰值样本 (Top $TOPN)"
+  local ss="" sg=""
+  if has_col SAMPLE_ID; then ss="sample_id,"; sg="sample_id,"; fi
+  run_sql "col ts format a22
+select * from (
+select $ICOL inst, $ss to_char(sample_time,'YYYY-MM-DD HH24:MI:SS') ts, count(*) active_sess
+from $RV_FULL
+where $TW
+group by $ICOLN, $sg to_char(sample_time,'YYYY-MM-DD HH24:MI:SS')
+order by active_sess desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- 活动会话突增 = 问题起点; 用 events / blockers / chain 下钻该时段."
+}
+
+#=====================================================================
+# events
+#=====================================================================
+cmd_events() {
+  banner
+  hdr "顶级等待事件 (ON CPU 合并)"
+  run_sql "col event format a46
+col wait_class format a14
+select * from (
+select nvl(event,'ON CPU') event, nvl($(strcol WAIT_CLASS),'-') wait_class,
+count(*) samples, round(count(*)*$IV) est_sec,
+count(distinct sql_id) sql_cnt
+from $RV_FULL
+where $TW
+group by nvl(event,'ON CPU'), nvl($(strcol WAIT_CLASS),'-')
+order by samples desc
+) where rownum <= $TOPN;"
+
+  hdr "事件 x SQL 交叉 (Top $TOPN)"
+  run_sql "col event format a38
+col sql_id format a15
+select * from (
+select nvl(event,'ON CPU') event, sql_id, count(*) samples, round(count(*)*$IV) est_sec
+from $RV_FULL
+where $TW and sql_id is not null
+group by nvl(event,'ON CPU'), sql_id
+order by samples desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- est_sec = 样本数 x ${IV}s (近似 DB time)."
+  echo "-- ON CPU 数接近物理 CPU 数 => 结合 OS 侧 (run queue / OSWatcher) 看."
+}
+
+#=====================================================================
+# sql
+#=====================================================================
+cmd_sql() {
+  banner
+  hdr "SQL 排行 (按 ASH 样本数)"
+  run_sql "col sql_id format a15
+col opname format a14
+select * from (
+select sql_id, max($(strcol SQL_OPNAME)) opname, count(*) samples, round(count(*)*$IV) est_sec,
+count(distinct session_id) sess_cnt,
+count(distinct $(numcol SQL_PLAN_HASH_VALUE)) phv_cnt
+from $RV_FULL
+where $TW and sql_id is not null
+group by sql_id
+order by samples desc
+) where rownum <= $TOPN;"
+
+  if has_col SQL_EXEC_ID; then
+    hdr "长执行识别 (同 sql_exec_id 样本 >= $MINSAMP, 约 $((MINSAMP*IV))s+)"
+    run_sql "col sql_id format a15
+col first_t format a17
+col last_t format a17
+select * from (
+select sql_id, sql_exec_id, count(*) samples, round(count(*)*$IV) est_sec,
+to_char(min(sample_time),'MM-DD HH24:MI:SS') first_t,
+to_char(max(sample_time),'MM-DD HH24:MI:SS') last_t,
+count(distinct session_id) sess_cnt
+from $RV_FULL
+where $TW and sql_id is not null and sql_exec_id is not null
+group by sql_id, sql_exec_id
+having count(*) >= $MINSAMP
+order by samples desc
+) where rownum <= $TOPN;"
+    echo
+    echo "-- 同一 sql_exec_id 反复采样 = 单次长执行; detail -S <sid> 看它在等什么."
+  fi
+}
+
+#=====================================================================
+# sessions
+#=====================================================================
+cmd_sessions() {
+  banner
+  hdr "会话排行 (按活动度)"
+  if has_col USER_ID; then
+    run_sql "col program format a30
+col machine format a22
+col username format a12
+select * from (
+select $ICOL inst, a.session_id, a.session_serial#, max(u.username) username,
+max(a.program) program, max(a.machine) machine,
+count(*) samples, round(count(*)*$IV) est_sec,
+count(distinct a.sql_id) sql_cnt
+from $RV_FULL a, $UTBL u
+where $TW and a.user_id = u.user_id (+)
+group by $ICOLN, a.session_id, a.session_serial#
+order by samples desc
+) where rownum <= $TOPN;"
+  else
+    run_sql "col program format a30
+col machine format a22
+select * from (
+select $ICOL inst, session_id, session_serial#,
+max(program) program, max(machine) machine,
+count(*) samples, round(count(*)*$IV) est_sec, count(distinct sql_id) sql_cnt
+from $RV_FULL
+where $TW
+group by $ICOLN, session_id, session_serial#
+order by samples desc
+) where rownum <= $TOPN;"
+  fi
+  echo
+  echo "-- user_id 属于产生样本的库: 异环境导入请加 -usermap <users表> 解析用户名."
+  if [ "$CROSS_ENV" = "1" ] && [ -z "$USERMAP" ] && has_col USER_ID; then
+    echo "-- 注意: 未配 -usermap, 上表 username 来自本地 dba_users (user_id 语义不同, 不可信)."
+  fi
+}
+
+#=====================================================================
+# blockers
+#=====================================================================
+cmd_blockers() {
+  has_col BLOCKING_SESSION || die "[$RV_FULL] 无 BLOCKING_SESSION 列, 无法分析阻塞"
+  banner
+
+  hdr "直接阻塞者 (等待者指向的 SID, 一层)"
+  run_sql "col binst format 9999 heading 'BINST'
+col bsid format 9999999 heading 'BSID'
+col bstat format a9 heading 'STATUS'
+col wait_evt format a36 heading 'WAIT_EVT'
+select * from (
+select $(numcol BLOCKING_INST_ID) binst, blocking_session bsid,
+$(strcol BLOCKING_SESSION_STATUS) bstat,
+nvl(event,'ON CPU') wait_evt,
+count(*) blocked_samples, round(count(*)*$IV) est_sec,
+count(distinct session_id) blocked_sess
+from $RV_FULL
+where $TW and blocking_session is not null
+group by $(numcol BLOCKING_INST_ID), blocking_session,
+$(strcol BLOCKING_SESSION_STATUS), nvl(event,'ON CPU')
+order by blocked_samples desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- STATUS=VALID 但上面表里找不到该 SID 行 => 持有者空闲未被采样(常见)."
+
+  hdr "根阻塞者 Root Blocker (等待树终点 = 终极持有者)"
+  build_cb
+  run_sql "col root_inst format 9999 heading 'R_INST'
+col root_sid format 9999999 heading 'R_SID'
+col root_ser format 9999999 heading 'R_SER'
+col root_prog format a26
+col root_evt format a45
+col root_sql format a15
+select * from (
+select ri root_inst, sid root_sid, ser root_ser,
+max(prog) root_prog, max(sqlid) root_sql, evt root_evt,
+count(*) chains, count(distinct sw) waiters, count(distinct st) root_samples,
+to_char(min(ts),'MM-DD HH24:MI:SS') first_t,
+to_char(max(ts),'MM-DD HH24:MI:SS') last_t
+from (
+  select ri, sid, ser, prog, sqlid, evt, ts, st,
+         to_char(sti)||'.'||to_char(ssid) sw
+  from (
+    select connect_by_isleaf isl,
+           $ICOL ri, session_id sid, session_serial# ser,
+           program prog, sql_id sqlid, nvl(event,'ON CPU') evt,
+           sample_time ts, $SMATCH_T st,
+           $CRINST sti, connect_by_root(session_id) ssid
+    from (select /*+ materialize$PHINT */ * from $RV_FULL where $TW) ash_win
+    start with blocking_session is not null
+    connect by nocycle
+          $CB
+  )
+  where isl = 1
+)
+group by ri, sid, ser, evt
+having count(*) >= 2
+order by chains desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- 判读: root_evt 是终极持有者自己在等的事件 => 真正病灶通常在这里,"
+  echo "--   而不是等待者表面的 event (如 cursor: pin S 的根常是 SGA resize)."
+  echo "-- chains=终点落在该持有者的链条数(样本级); waiters=不同受害者会话数;"
+  echo "-- root_samples=持有者作为链终点的样本数(持续时长参考); first/last=时间范围."
+  echo "-- 跨实例边按 ${XTOL}s 容差匹配; 未被采样的持有者不进树 -> 对照上面直接表."
+  echo "-- 大窗口慢时: 缩窗口或 -p N 并行."
+}
+
+#=====================================================================
+# chain
+#=====================================================================
+cmd_chain() {
+  has_col BLOCKING_SESSION || die "[$RV_FULL] 无 BLOCKING_SESSION 列, 无法分析等待链"
+  banner
+  build_cb
+
+  if [ -n "$SESSID" ]; then
+    hdr "会话 $SESSID 向上等待链 (path: 受害者>...>终点; 每行一个采样)"
+    run_sql "col ts format a21
+col path format a60
+col event format a32
+col sql_id format a15
+col program format a26
+col binst format 9999 heading 'BINST'
+col bsid format 9999999 heading 'BSID'
+select * from (
+select ts, path, lv, isleaf, iscycle, inst, sid, ser, state, event,
+sql_id, program, binst, bsid
+from (
+select level lv, connect_by_isleaf isleaf, connect_by_iscycle iscycle,
+to_char(sample_time,'YYYY-MM-DD HH24:MI:SS') ts, $ICOL inst,
+session_id sid, session_serial# ser, session_state state,
+nvl(event,'ON CPU') event, sql_id sql_id, program program,
+rpad(substr(sys_connect_by_path($PELEM, '>'), 2),60) path,
+$(strcol BLOCKING_INST_ID) binst, $(strcol BLOCKING_SESSION) bsid,
+$CRM rsmt, $CRINST rinst, connect_by_root(session_id) rsid
+from (select /*+ materialize$PHINT */ * from $RV_FULL where $TW) ash_win
+start with session_id = $SESSID
+connect by nocycle
+      $CB
+)
+order by rsmt, rinst, rsid, lv
+) where rownum <= 5000;"
+    echo
+    echo "-- path 最左 = 追踪的会话, 向右依次是它等的人; isleaf=1 = 链终点"
+    echo "--   (持有者未被采样或真无阻塞). iscycle=1 = 等待环(重点!)."
+    echo "-- path 缩写: 元素=sid; 跨实例链元素带实例号(实例.sid). 列宽 60."
+    echo "-- 窗口内无该会话样本时输出为空: 调整 -m/-t/-T."
+  else
+    hdr "等待链树 (path: 受害者>...>终点; 仅显示 >=2 层的链)"
+    run_sql "col ts format a21
+col path format a60
+col event format a32
+col sql_id format a15
+col program format a26
+col binst format 9999 heading 'BINST'
+col bsid format 9999999 heading 'BSID'
+select * from (
+select ts, path, lv, isleaf, iscycle, inst, sid, ser, state, event,
+sql_id, program, binst, bsid
+from (
+select x.*, max(lv) over (partition by rinst, rsid, rsmt) maxlv
+from (
+select level lv, connect_by_isleaf isleaf, connect_by_iscycle iscycle,
+to_char(sample_time,'YYYY-MM-DD HH24:MI:SS') ts, $ICOL inst,
+session_id sid, session_serial# ser, session_state state,
+nvl(event,'ON CPU') event, sql_id sql_id, program program,
+rpad(substr(sys_connect_by_path($PELEM, '>'), 2),60) path,
+$(strcol BLOCKING_INST_ID) binst, $(strcol BLOCKING_SESSION) bsid,
+$CRM rsmt, $CRINST rinst, connect_by_root(session_id) rsid
+from (select /*+ materialize$PHINT */ * from $RV_FULL where $TW) ash_win
+start with blocking_session is not null
+connect by nocycle
+      $CB
+) x
+)
+where maxlv >= 2
+order by rsmt, rinst, rsid, lv
+) where rownum <= 2000;"
+    echo
+    echo "-- 每行 path 是完整链: 最左=受害者, 最右=链终点(持有者); 输出截断 2000 行."
+    echo "-- path 缩写: 元素=sid; 跨实例链元素带实例号(实例.sid). 列宽 60."
+    echo "-- 单层链(持有者未被采样)看 blockers; iscycle=1 = 等待环(死锁类, 重点!)."
+    echo "-- 建议小窗口 (默认5分钟); 跨实例边按 ${XTOL}s 容差匹配."
+  fi
+}
+
+#=====================================================================
+# detail
+#=====================================================================
+cmd_detail() {
+  banner
+  hdr "会话 $SESSID ASH 时间线"
+  run_sql "col ts format a23
+col event format a32
+col sql_id format a15
+col program format a24
+col bstat format a9 heading 'BSTAT'
+col p1t format a17
+col p2t format a17
+select to_char(sample_time,'YYYY-MM-DD HH24:MI:SS.FF3') ts, $ICOL inst,
+session_id sid, session_serial# ser, session_state,
+nvl(event,'ON CPU') event, $(numcol SEQ#) seq#,
+$(strcol P1TEXT) p1t, $(numcol P1) p1, $(strcol P2TEXT) p2t, $(numcol P2) p2,
+sql_id, $(numcol SQL_PLAN_HASH_VALUE) phv, $(numcol SQL_EXEC_ID) exec_id,
+$(strcol BLOCKING_INST_ID) binst, $(strcol BLOCKING_SESSION) bsid,
+$(strcol BLOCKING_SESSION_STATUS) bstat,
+$(numcol PGA_ALLOCATED) pga_b, $(numcol TEMP_SPACE_ALLOCATED) tmp_b,
+program
+from $RV_FULL
+where $TW and session_id = $SESSID
+order by sample_time;"
+
+  hdr "seq# 停滞分析 (同 event+seq# 多次采样 = 卡在同一等待)"
+  run_sql "col event format a32
+col first_t format a20
+col last_t format a20
+select * from (
+select nvl(event,'ON CPU') event, $(numcol SEQ#) seq#, count(*) samples,
+count(*)*$IV est_sec,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') first_t,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') last_t
+from $RV_FULL
+where $TW and session_id = $SESSID
+group by nvl(event,'ON CPU'), $(numcol SEQ#)
+having count(*) > 1
+order by samples desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- seq# 不变 = 卡死在同一等待(hang); seq# 递进 = 在走只是慢."
+  echo "-- p1/p2 配合 p1t/p2t: 如 db file sequential read 的 p1=file# p2=block#."
+}
+
+#=====================================================================
+# obj
+#=====================================================================
+cmd_obj() {
+  has_col CURRENT_OBJ# || die "[$RV_FULL] 无 CURRENT_OBJ# 列"
+  banner
+  hdr "热点对象 (current_obj#, Top $TOPN)"
+  run_sql "col objname format a44
+col otype format a14
+col event format a34
+select * from (
+select a.current_obj# obj#, nvl(o.owner||'.'||o.object_name,'(未解析)') objname,
+nvl($OBJTYPE_EXPR,'-') otype, nvl(a.event,'ON CPU') event,
+count(*) samples, count(distinct a.session_id) sess_cnt
+from $RV_FULL a, $OBJTBL o
+where $TW and a.current_obj# > 0 and a.current_obj# = o.object_id (+)
+group by a.current_obj#, nvl(o.owner||'.'||o.object_name,'(未解析)'),
+nvl($OBJTYPE_EXPR,'-'), nvl(a.event,'ON CPU')
+order by samples desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- I/O / 行锁类等待的落脚对象."
+  if [ -n "$OBJMAP" ]; then
+    echo "-- objmap: 对象名来自 $OBJTBL (源库字典导入)."
+  elif [ "$CROSS_ENV" = "1" ]; then
+    echo "-- 注意: 数据 DBID 与本地不一致(异环境导入), 本地 dba_objects 解析不可信;"
+    echo "--       请导入源库 dba_objects 后加 -objmap 重新解析."
+  else
+    echo "-- 导入表的 obj# 属于源库: 需导入源库 dba_objects 后用 -objmap 解析."
+  fi
+}
+
+#=====================================================================
+# res
+#=====================================================================
+cmd_res() {
+  if ! has_col PGA_ALLOCATED && ! has_col TEMP_SPACE_ALLOCATED; then
+    die "[$RV_FULL] 无 PGA_ALLOCATED / TEMP_SPACE_ALLOCATED 列"
+  fi
+  banner
+  hdr "PGA / 临时表空间消耗 (按 SQL 峰值)"
+  run_sql "col sql_id format a15
+col program format a27
+select * from (
+select nvl(sql_id,'(null)') sql_id, max(program) program, count(*) samples,
+round(nvl(max($(numcol PGA_ALLOCATED)),0)/1073741824, 2) max_pga_gb,
+round(nvl(max($(numcol TEMP_SPACE_ALLOCATED)),0)/1073741824, 2) max_tmp_gb,
+count(distinct session_id) sess_cnt
+from $RV_FULL
+where $TW and ( $(numcol PGA_ALLOCATED) is not null or $(numcol TEMP_SPACE_ALLOCATED) is not null )
+group by nvl(sql_id,'(null)')
+order by greatest(nvl(max($(numcol PGA_ALLOCATED)),0), nvl(max($(numcol TEMP_SPACE_ALLOCATED)),0)) desc
+) where rownum <= $TOPN;"
+  echo
+  echo "-- ORA-4030 / 临时表空间撑爆的排查入口; 结合 detail -S 看会话级时间线."
+}
+
+#=====================================================================
+# text
+#=====================================================================
+cmd_text() {
+  banner
+  hdr "sql_id = $SQLID 的 SQL 文本"
+  local dbcond=""
+  if [ -n "$DBIDF" ]; then
+    if [ -z "$SQLMAP" ]; then
+      dbcond=" and dbid = $DBIDF"
+    else
+      case " $SQLMAP_COLS " in *" DBID "*) dbcond=" and dbid = $DBIDF";; esac
+    fi
+  fi
+  run_sql "set pagesize 5000 linesize 220 long 1000000
+column t1 heading 'SQL_TEXT' format a200
+select $SQLTEXT_EXPR t1 from $SQLTBL where sql_id = '$SQLID'$dbcond and rownum = 1;"
+  if [ "$CROSS_ENV" = "1" ] && [ -z "$SQLMAP" ]; then
+    echo "-- 提示: 异环境导入数据, 本地字典无此 SQL; 请导入源库 dba_hist_sqltext 后加 -sqlmap."
+  fi
+  if [ -z "$SQLMAP" ]; then
+    echo "-- (上面为空再查内存 v\$sqlarea -- 仅近期 SQL)"
+    run_sql "set pagesize 5000 linesize 220 long 1000000
+column t1 heading 'SQL_TEXT' format a200
+select sql_fulltext t1 from v\$sqlarea where sql_id = '$SQLID' and rownum = 1;"
+  fi
+}
+
+#=====================================================================
+# all
+#=====================================================================
+cmd_all() {
+  banner
+  echo
+  echo "############ 1. 范围 ############"
+  run_sql "select count(*) rows_in_window,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') window_begin,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') window_end
+from $RV_FULL where $TW;"
+  run_sql "col inst format 9999 heading 'INST'
+select $ICOL inst, count(*) rows_, count(distinct session_id) sessions
+from $RV_FULL where $TW group by $ICOLN order by 1;"
+
+  echo
+  echo "############ 2. 峰值样本 ############"
+  local ss="" sg=""
+  if has_col SAMPLE_ID; then ss="sample_id,"; sg="sample_id,"; fi
+  run_sql "col ts format a22
+select * from (
+select $ICOL inst, $ss to_char(sample_time,'YYYY-MM-DD HH24:MI:SS') ts, count(*) active_sess
+from $RV_FULL where $TW
+group by $ICOLN, $sg to_char(sample_time,'YYYY-MM-DD HH24:MI:SS')
+order by active_sess desc
+) where rownum <= $TOPN;"
+
+  echo
+  echo "############ 3. 顶级事件 ############"
+  run_sql "col event format a46
+col wait_class format a14
+select * from (
+select nvl(event,'ON CPU') event, nvl($(strcol WAIT_CLASS),'-') wait_class,
+count(*) samples, round(count(*)*$IV) est_sec, count(distinct sql_id) sql_cnt
+from $RV_FULL where $TW
+group by nvl(event,'ON CPU'), nvl($(strcol WAIT_CLASS),'-')
+order by samples desc
+) where rownum <= $TOPN;"
+
+  echo
+  echo "############ 4. SQL 排行 ############"
+  run_sql "col sql_id format a15
+col opname format a14
+select * from (
+select sql_id, max($(strcol SQL_OPNAME)) opname, count(*) samples, round(count(*)*$IV) est_sec,
+count(distinct session_id) sess_cnt
+from $RV_FULL where $TW and sql_id is not null
+group by sql_id order by samples desc
+) where rownum <= $TOPN;"
+
+  echo
+  echo "############ 5. 会话排行 ############"
+  if has_col USER_ID; then
+    run_sql "col program format a30
+col username format a12
+select * from (
+select $ICOL inst, a.session_id, a.session_serial#, max(u.username) username,
+max(a.program) program, count(*) samples, round(count(*)*$IV) est_sec
+from $RV_FULL a, $UTBL u
+where $TW and a.user_id = u.user_id (+)
+group by $ICOLN, a.session_id, a.session_serial#
+order by samples desc
+) where rownum <= $TOPN;"
+  fi
+
+  echo
+  echo "############ 6. 阻塞 ############"
+  if has_col BLOCKING_SESSION; then
+    run_sql "col binst format 9999 heading 'BINST'
+col bsid format 9999999 heading 'BSID'
+col bstat format a9 heading 'STATUS'
+select * from (
+select $(numcol BLOCKING_INST_ID) binst, blocking_session bsid,
+$(strcol BLOCKING_SESSION_STATUS) bstat,
+count(*) blocked_samples, count(distinct session_id) blocked_sess
+from $RV_FULL where $TW and blocking_session is not null
+group by $(numcol BLOCKING_INST_ID), blocking_session, $(strcol BLOCKING_SESSION_STATUS)
+order by blocked_samples desc
+) where rownum <= $TOPN;"
+    echo
+    build_cb
+    run_sql "col root_evt format a45
+select * from (
+select ri root_inst, sid root_sid, evt root_evt,
+max(sqlid) root_sql, count(*) chains, count(distinct sw) waiters
+from (
+  select ri, sid, evt, sqlid, st, to_char(sti)||'.'||to_char(ssid) sw
+  from (
+    select connect_by_isleaf isl,
+           $ICOL ri, session_id sid, nvl(event,'ON CPU') evt, sql_id sqlid,
+           $SMATCH_T st,
+           $CRINST sti, connect_by_root(session_id) ssid
+    from (select /*+ materialize$PHINT */ * from $RV_FULL where $TW) ash_win
+    start with blocking_session is not null
+    connect by nocycle
+          $CB
+  )
+  where isl = 1
+)
+group by ri, sid, evt
+having count(*) >= 2
+order by chains desc
+) where rownum <= $TOPN;"
+  else
+    echo "-- 无 BLOCKING_SESSION 列, 跳过"
+  fi
+
+  echo
+  echo "############ 方法提示 ############"
+  echo "-- 1) 峰值突增段 => 锁定问题窗口 (trend)"
+  echo "-- 2) 顶级事件 => 症状分类: CPU/IO/锁/集群 (events)"
+  echo "-- 3) root blocker 的 root_evt => 真正病灶 (blockers)"
+  echo "-- 4) chain -S <root_sid> 看链路; detail -S 看 seq# 停滞"
+  echo "-- 5) obj 热点对象; res 内存/临时段; text -q <sql_id> 看 SQL"
+  echo "-- 6) est_sec = 样本 x ${IV}s | 布局: $RV_KIND | 容差: ${XTOL}s"
+}
+
+#=====================================================================
+# export -- 生成客户环境信息收集脚本 (四件套 + expdp)
+#=====================================================================
+cmd_export() {
+  echo "==================================================================="
+  echo " ash_analyzer v$VERSION | 生成客户环境 ASH 信息收集脚本"
+  echo "==================================================================="
+  echo
+  echo "-- 用途: 在客户环境收集指定时间窗口的 ASH + 配套字典, 打成 dmp"
+  echo "-- 注意: -s 指定的是 ORACLE_SID(目标库); RAC 多实例想限定节点请用 -g <实例号>"
+  echo "--       拷回本机 impdp 后用 ash_analyzer -i <导入表> 分析."
+  echo
+  while : ; do
+    if [ -n "$TBEG" ]; then
+      printf "窗口起点 -t [%s]: " "$TBEG"
+      if ! read -r ans; then ans=""; fi
+      [ -n "$ans" ] && { valid_ts "$ans" || { echo "  格式应为 YYYY-MM-DD HH24:MI:SS, 重输" >&2; continue; }; TBEG="$ans"; }
+    else
+      printf "窗口起点 -t (YYYY-MM-DD HH24:MI:SS): "
+      read -r ans || { echo "输入结束(EOF)且未提供 -t" >&2; exit 1; }
+      [ -z "$ans" ] && { echo "  不能为空" >&2; continue; }
+      valid_ts "$ans" || { echo "  格式应为 YYYY-MM-DD HH24:MI:SS, 重输" >&2; continue; }
+      TBEG="$ans"
+    fi
+    break
+  done
+  while : ; do
+    if [ -n "$TEND" ]; then
+      printf "窗口终点 -T [%s]: " "$TEND"
+      if ! read -r ans; then ans=""; fi
+      [ -n "$ans" ] && { valid_ts "$ans" || { echo "  格式应为 YYYY-MM-DD HH24:MI:SS, 重输" >&2; continue; }; TEND="$ans"; }
+    else
+      printf "窗口终点 -T (YYYY-MM-DD HH24:MI:SS): "
+      read -r ans || { echo "输入结束(EOF)且未提供 -T" >&2; exit 1; }
+      [ -z "$ans" ] && { echo "  不能为空" >&2; continue; }
+      valid_ts "$ans" || { echo "  格式应为 YYYY-MM-DD HH24:MI:SS, 重输" >&2; continue; }
+      TEND="$ans"
+    fi
+    if [ "$TEND" \< "$TBEG" ]; then echo "  终点必须晚于起点, 重输" >&2; continue; fi
+    break
+  done
+
+  # 实例说明: -s 选的是 ORACLE_SID(哪个库); RAC 多实例时用 -g N 限定 instance_number
+  printf "RAC 实例号过滤 -g (1..N, 回车=全部实例)%s\n" "${INSTF:+ [$INSTF]}"
+  if [ -z "$INSTF" ]; then
+    read -r ans || ans=""
+    case "$ans" in
+      "") : ;;
+      [1-9]|[1-9][0-9]) INSTF="$ans" ;;
+      *) echo "  实例号应为数字, 忽略该输入(=全部实例)" >&2 ;;
+    esac
+  fi
+
+  local tag
+  tag=$(echo "${TBEG} ${TEND}" | tr -dc '0-9' | cut -c1-12)
+  [ -z "$tag" ] && tag=$(date +%Y%m%d%H%M%S)
+  [ -z "$OUTF" ] && OUTF="/tmp/ash_collect_${tag}.sh"
+
+  local inst_line=""
+  [ -n "$INSTF" ] && inst_line="and instance_number = $INSTF"
+
+  cat > "$OUTF" <<'GENEOF'
+#!/bin/bash
+#=====================================================================
+# ash 收集脚本 (由 ash_analyzer 的 export 生成; sh/bash 通用)
+# 用法(客户环境, oracle 用户): sh <本脚本>
+#  产物: @@DPDIR@@ 指向的目录/ash_collect_@@TAG@@.dmp + 同级 collect.log
+#  拷回分析机: impdp 后 ./ash_analyzer info -i @@TOWNER@@.m_ash_@@TAG@@
+#=====================================================================
+@@SIDLINE@@
+@@CONNLINE@@
+set +x
+TAG=@@TAG@@
+TOWNER=@@TOWNER@@
+DPDIR=@@DPDIR@@
+# --- env bootstrap: ORACLE_HOME 未设时从 pmon/oratab/常见路径探测 ---
+if [ -n "$ORACLE_SID" ] && [ -z "$ORACLE_HOME" ]; then
+  ORACLE_HOME=$(awk -F: -v s="$ORACLE_SID" '$1==s {print $2; exit}' /etc/oratab 2>/dev/null)
+fi
+if [ -z "$ORACLE_HOME" ]; then
+  for hh in $(awk -F: '/^[^#+-]/ && $2!="" {print $2}' /etc/oratab 2>/dev/null | sort -u) \
+            /opt/oracle/product/*/dbhome_* /u01/app/oracle/product/*/dbhome_* \
+            /opt/oracle/products/*/db_*/ /opt/ora*/*/dbhome_*/ /opt/oracle/product/*/*/; do
+    [ -x "$hh/bin/sqlplus" ] || continue
+    if [ -n "$ORACLE_SID" ]; then
+      _tst=$(ORACLE_HOME="$hh" ORACLE_SID="$ORACLE_SID" PATH="$hh/bin:/usr/bin:/bin" \
+             timeout 20 "$hh/bin/sqlplus" -S -L "$ASH_CONN" <<'TE' 2>/dev/null
+set heading off feedback off pages 0
+select 'ASH_HOME_OK' from dual;
+exit
+TE
+)
+      case "$_tst" in *ASH_HOME_OK*) export ORACLE_HOME="$hh"; break ;; esac
+    else
+      export ORACLE_HOME="$hh"; break
+    fi
+  done
+fi
+[ -z "$ORACLE_HOME" ] && { log "!! 无法确定 ORACLE_HOME: 请先 . oraenv"; exit 1; }
+[ -z "$ORACLE_SID" ] && { log "!! 无法确定 ORACLE_SID : 请先 . oraenv"; exit 1; }
+export PATH="$ORACLE_HOME/bin:$PATH"
+OUT_DIR=/tmp/ash_collect_$TAG
+mkdir -p $OUT_DIR
+LOG=$OUT_DIR/collect.log
+log() { echo "$*" | tee -a "$LOG"; }
+
+DBID=$(sqlplus -S -L "$ASH_CONN" <<'DBIDQ' 2>/dev/null
+set pages 0 lines 120 heading off feedback off
+select 'CONNECTED_DB: '||name||' dbid='||dbid||' '||log_mode from v$database;
+exit
+DBIDQ
+)
+log "===== 0. 环境 ====="
+echo "$DBID"
+case "$DBID" in *CONNECTED_DB*) : ;; *) log "!! 无法连接数据库"; exit 1 ;; esac
+
+# 校验临时表用户 / 导出 directory
+ENVCHK=$(sqlplus -S -L "$ASH_CONN" <<'ENVQ' 2>/dev/null
+set pages 0 lines 200 heading off feedback off trimspool on
+select 'CHK_USER: '||username from dba_users where username=upper('@@TOWNER@@');
+select 'CHK_DIR: '||directory_name from dba_directories where directory_name=upper('@@DPDIR@@');
+exit
+ENVQ
+)
+case "$ENVCHK" in *CHK_USER*) : ;; *) log "!! 临时表用户 @@TOWNER@@ 不存在"; exit 1 ;; esac
+case "$ENVCHK" in *CHK_DIR*) : ;; *) log "!! directory @@DPDIR@@ 不存在"; exit 1 ;; esac
+log "临时表用户: @@TOWNER@@   导出 directory: @@DPDIR@@"
+
+log "===== 1. CTAS 五件套 ====="
+sqlplus -S -L "$ASH_CONN" <<'SQLCTAS' >> "$LOG" 2>&1
+whenever sqlerror exit 1
+set heading off feedback off pages 0
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+whenever sqlerror continue
+@@DROPS@@
+whenever sqlerror exit 1
+create table @@TOWNER@@.m_ash_@@TAG@@ as
+select *
+  from dba_hist_active_sess_history
+ where sample_time >= to_timestamp('@@TBEG@@','YYYY-MM-DD HH24:MI:SS')
+   and sample_time <= to_timestamp('@@TEND@@','YYYY-MM-DD HH24:MI:SS')
+   @@INST_LINE@@;
+create table @@TOWNER@@.m_obj_@@TAG@@ as
+select object_id, owner, object_name, object_type from dba_objects;
+create table @@TOWNER@@.m_sqltext_@@TAG@@ as
+select s.sql_id,
+       dbms_lob.substr(s.sql_text, 3800, 1) sql_text
+  from dba_hist_sqltext s
+ where s.sql_id in (select distinct sql_id from @@TOWNER@@.m_ash_@@TAG@@ where sql_id is not null)
+   and s.dbid = (select dbid from v$database where rownum = 1)
+ group by s.sql_id, dbms_lob.substr(s.sql_text, 3800, 1);
+create table @@TOWNER@@.m_users_@@TAG@@ as
+select user_id, username from dba_users;
+create table @@TOWNER@@.m_snap_@@TAG@@ as
+select snap_id, dbid, instance_number,
+       to_char(begin_interval_time,'YYYY-MM-DD HH24:MI:SS') begin_time,
+       to_char(end_interval_time,'YYYY-MM-DD HH24:MI:SS') end_time
+  from dba_hist_snapshot
+ where end_interval_time >= to_timestamp('@@TBEG@@','YYYY-MM-DD HH24:MI:SS') - 1/24
+   and begin_interval_time <= to_timestamp('@@TEND@@','YYYY-MM-DD HH24:MI:SS') + 1/24;
+prompt CTAS_DONE
+exit
+SQLCTAS
+if [ $? -ne 0 ]; then log "!! CTAS 失败, 详见 $LOG"; exit 1; fi
+
+log "===== 2. 行数统计 ====="
+sqlplus -S -L "$ASH_CONN" <<'SQLCNT' > "$OUT_DIR/counts.txt"
+set pages 0 lines 200 heading off feedback off trimspool on
+select 'm_ash    : '||count(*) from @@TOWNER@@.m_ash_@@TAG@@;
+select 'm_sqltext: '||count(*) from @@TOWNER@@.m_sqltext_@@TAG@@;
+select 'm_obj    : '||count(*) from @@TOWNER@@.m_obj_@@TAG@@;
+select 'm_users  : '||count(*) from @@TOWNER@@.m_users_@@TAG@@;
+select 'm_snap   : '||count(*) from @@TOWNER@@.m_snap_@@TAG@@;
+exit
+SQLCNT
+CNT_OUT=$?
+cat "$OUT_DIR/counts.txt" >> "$LOG"
+
+grep -E "m_ash|m_sqltext|m_obj|m_users|m_snap" "$OUT_DIR/counts.txt" | tee -a "$LOG" | head -5
+
+log "===== 3. expdp 打包 ====="
+TBLLIST="$TOWNER.m_ash_$TAG,$TOWNER.m_obj_$TAG,$TOWNER.m_sqltext_$TAG,$TOWNER.m_users_$TAG,$TOWNER.m_snap_$TAG"
+printf 'userid="%s"\ntables=%s\ndirectory=%s\ndumpfile=ash_collect_%s.dmp\nlogfile=ash_collect_%s_exp.log\ncompression=all\nREUSE_DUMPFILES=y\n' "$ASH_CONN" "$TBLLIST" "$DPDIR" "$TAG" "$TAG" > "$OUT_DIR/exp.par"
+sqlplus -S -L "$ASH_CONN" <<'SQLDP' > "$OUT_DIR/dp.txt" 2>/dev/null
+set pages 0 lines 300 heading off feedback off trimspool on
+select 'DPFOUND: '||directory_path from dba_directories where directory_name=upper('@@DPDIR@@');
+exit
+SQLDP
+DP=$(grep -o 'DPFOUND: .*' "$OUT_DIR/dp.txt" 2>/dev/null | head -1 | sed 's/^DPFOUND: //')
+grep -v DPFOUND "$OUT_DIR/dp.txt" >> "$LOG" 2>/dev/null
+expdp parfile="$OUT_DIR/exp.par" < /dev/null >> "$LOG" 2>&1
+if [ $? -ne 0 ]; then log "!! expdp 失败, 详见 $LOG"; exit 1; fi
+
+log "===== 4. 清理 CTAS 中间表 ====="
+sqlplus -S -L "$ASH_CONN" <<'SQLDROP' >> "$LOG" 2>&1
+whenever sqlerror continue
+set heading off feedback off pages 0
+drop table @@TOWNER@@.m_ash_@@TAG@@ purge;
+drop table @@TOWNER@@.m_obj_@@TAG@@ purge;
+drop table @@TOWNER@@.m_sqltext_@@TAG@@ purge;
+drop table @@TOWNER@@.m_users_@@TAG@@ purge;
+drop table @@TOWNER@@.m_snap_@@TAG@@ purge;
+exit
+SQLDROP
+
+DP=$(grep -o 'DPFOUND: .*' "$OUT_DIR/dp.txt" 2>/dev/null | head -1 | sed 's/^DPFOUND: //')
+log "============================================================"
+log " 收集完成. 产物:"
+log "   $DP/ash_collect_$TAG.dmp"
+log "   $LOG"
+log " 拷回分析机后:"
+log "   impdp \"/ as sysdba\" dumpfile=ash_collect_$TAG.dmp"
+log "   ./ash_analyzer info -i $TOWNER.m_ash_$TAG"
+log "============================================================"
+GENEOF
+  # 占位符回填 (生成器常量): 窗口/tag/连接/SID/实例过滤
+  _DROPS="whenever sqlerror continue"
+  for _t in m_ash m_obj m_sqltext m_users m_snap; do
+    _DROPS="$_DROPS
+drop table system.${_t}_${tag} purge;"
+  done
+  _SIDLINE='[ -n "'"$SID_IN"'" ]'
+  sed -i.bak \
+    -e "s|@@TAG@@|$tag|g" \
+    -e "s|@@TBEG@@|$TBEG|g" \
+    -e "s|@@TEND@@|$TEND|g" \
+    -e "s|@@INST_LINE@@|$inst_line|g" \
+    -e "s|@@SIDLINE@@|[ -n \"$SID_IN\" ] \&\& { export ORACLE_SID=\"$SID_IN\"; export ORACLE_HOME; }|" \
+    -e "s|@@CONNLINE@@|ASH_CONN=\"$CONN\"; export ASH_CONN|" \
+    -e "s|@@TOWNER@@|${TOWNER:-system}|g" \
+    -e "s|@@DPDIR@@|${DPDIR:-DATA_PUMP_DIR}|g" \
+    "$OUTF" >/dev/null 2>&1 || true
+  # DROPS 多行替换用 perl 不可靠; 简化: 连同幂等 drop 一起确保 — 直接用 awk 替换含 @@DROPS@@ 行
+  _tom="${TOWNER:-system}"
+  awk -v tag="$tag" -v tom="$_tom" 'BEGIN{RS="\0"} {gsub(/@@DROPS@@/, "whenever sqlerror continue\ndrop table " tom ".m_ash_" tag " purge;\ndrop table " tom ".m_obj_" tag " purge;\ndrop table " tom ".m_sqltext_" tag " purge;\ndrop table " tom ".m_users_" tag " purge;\ndrop table " tom ".m_snap_" tag " purge;"); print}' "$OUTF" > "$OUTF.new" 2>/dev/null && mv "$OUTF.new" "$OUTF"
+  rm -f "$OUTF.bak" 2>/dev/null
+  chmod 700 "$OUTF" 2>/dev/null
+
+  echo
+  echo "-- 收集脚本已生成: $OUTF"
+  echo "-- 窗口: $TBEG ~ $TEND  实例: ${INSTF:-全部}  目标库SID: ${SID_IN:-(运行时自动探测)}"
+  echo "-- 临时表用户: ${TOWNER:-system}   导出 directory: ${DPDIR:-DATA_PUMP_DIR}"
+  bash -n "$OUTF" || die "生成的脚本语法检查失败"
+  echo "-- 语法校验: OK (sh/bash 均兼容)"
+  echo "-- 下一步: 拷贝 $OUTF 到客户环境执行 sh $(basename "$OUTF")"
+}
+
+#=====================================================================
+# diag -- 生成客户侧自诊断脚本 (不连库, 客户本地跑六步法出初步报告)
+#=====================================================================
+
+#!/bin/bash
+#=========================================================
+cmd_diag() {
+  echo "==================================================================="
+  echo " ash_analyzer v$VERSION | 生成客户侧 ASH 自诊断脚本 (可重复执行)"
+  echo "==================================================================="
+  echo
+  echo "-- 场景: 拿不到 ASH 导出 / 无法远程到客户环境时, 把本脚本发给客户."
+  echo "--       客户反复执行: 可随时调整时间窗, 回车沿用上次, 输出简洁."
+  echo
+  while : ; do
+    if [ -n "$VIEW_IN" ]; then
+      printf "ASH 视图/表名 -i [%s]: " "$VIEW_IN"
+      read -r ans || ans=""
+      [ -n "$ans" ] && { valid_qual "$ans" || { echo "  非法对象名, 重输" >&2; continue; }; VIEW_IN="$ans"; }
+    else
+      printf "ASH 视图/表名 -i (回车=默认 AWR 历史视图): "
+      read -r ans || ans=""
+      [ -n "$ans" ] && { valid_qual "$ans" || { echo "  非法对象名, 重输" >&2; continue; }; VIEW_IN="$ans"; }
+    fi
+    break
+  done
+  [ -z "$VIEW_IN" ] && VIEW_IN="dba_hist_active_sess_history"
+
+  local tag
+  tag=$(date +%Y%m%d%H%M%S)
+  [ -z "$OUTF" ] && OUTF="/tmp/ash_diag_${tag}.sh"
+
+  local ash_src inst_line inst_col
+  case "$VIEW_IN" in
+    gv|gash)    ash_src='gv\$active_session_history' ;;
+    v|ash)      ash_src='v\$active_session_history' ;;
+    hist|h|awr) ash_src='dba_hist_active_sess_history' ;;
+    *)          ash_src="$VIEW_IN" ;;
+  esac
+  [ -n "$INSTF" ] && inst_line="and instance_number = $INSTF"
+  case "$ash_src" in *\$|gv*|v*) inst_col="inst_id" ;; *) inst_col="instance_number" ;; esac
+
+  cat > "$OUTF" <<'GENEOF'
+#!/bin/bash
+#=====================================================================
+# ASH 自诊断脚本 (由 ash_analyzer 的 diag 生成; 可重复执行)
+# 用法: oracle 用户执行  sh <本脚本>
+#   每次运行: 输入数据源/时间窗, 回车沿用上次 (状态存同目录 ash_diag_run.conf)
+#   输出简洁: 进度提示 + 结论摘要; 完整报告 diag_report_<tag>.txt 按窗归档
+#   只读查询, 不建表不写库; 无 dba 权限自动降级 all_ 视图
+#=====================================================================
+_here=$(cd "$(dirname "$0")" 2>/dev/null && pwd); cd "$_here" || exit 1
+CFG="$_here/ash_diag_run.conf"
+DBIDQ_TAG=diag_conn
+[ -f "$CFG" ] && . "$CFG"
+say() { printf '%s\n' "$*"; }
+ask() { printf '%s [%s]: ' "$1" "$2" >&2; read -r a || a=""; printf '%s' "$a"; }
+
+# ---- 环境自举: ORACLE_SID/HOME 未设时自动解析 ----
+if [ -z "$ORACLE_SID" ]; then
+  export ORACLE_SID=$(ps -ef 2>/dev/null | grep 'ora_pmon_' | grep -v grep | sed 's/.*ora_pmon_//' | head -1)
+fi
+if [ -n "$ORACLE_SID" ] && [ -z "$ORACLE_HOME" ]; then
+  export ORACLE_HOME=$(awk -F: -v s="$ORACLE_SID" '$1==s {print $2; exit}' /etc/oratab 2>/dev/null)
+  if [ -z "$ORACLE_HOME" ]; then
+    for hh in $(awk -F: '/^[^#+-]/ && $2!="" {print $2}' /etc/oratab 2>/dev/null | sort -u) \
+              /opt/oracle/product/*/dbhome_* /u01/app/oracle/product/*/dbhome_* \
+              /opt/oracle/products/*/dbhome_* /opt/ora*/*/dbhome_*; do
+      [ -x "$hh/bin/sqlplus" ] || continue
+      _tst=$(ORACLE_HOME="$hh" ORACLE_SID="$ORACLE_SID" PATH="$hh/bin:/usr/bin:/bin" \
+             timeout 20 "$hh/bin/sqlplus" -S -L '/ as sysdba' <<'TE' 2>/dev/null
+set heading off feedback off pages 0
+select 'ASH_HOME_OK' from dual;
+exit
+TE
+)
+      case "$_tst" in *ASH_HOME_OK*) export ORACLE_HOME="$hh"; break ;; esac
+    done
+  fi
+fi
+[ -z "$ORACLE_HOME" ] && { say "!! 无法确定 ORACLE_HOME: 请先 . oraenv"; exit 1; }
+[ -z "$ORACLE_SID"  ] && { say "!! 无法确定 ORACLE_SID : 请先 . oraenv";  exit 1; }
+export PATH="$ORACLE_HOME/bin:$PATH"
+CONN="/ as sysdba"
+
+_DBOK=$(sqlplus -S -L "$CONN" <<'DBIDQ'
+set pages 0 lines 120 heading off feedback off
+select 'CONNECTED_DB: '||name||'  dbid='||dbid from v$database;
+exit
+DBIDQ
+)
+say "$_DBOK"
+
+echo "===== ASH 自诊断 ====="
+DEF_V="__ASH_VIEW__"
+_v=$(ask "数据源" "$DEF_V"); [ -n "$_v" ] && V="$_v" || V="$DEF_V"
+_t1=$(ask "窗口起点 YYYY-MM-DD HH24:MI:SS (回车=沿用)" "${TBEG:-}"); T1="${_t1:-${TBEG:-}}"
+_t2=$(ask "窗口终点 YYYY-MM-DD HH24:MI:SS (回车=沿用)" "${TEND:-}"); T2="${_t2:-${TEND:-}}"
+[ -z "$T1" ] && { say "!! 起点为空且无上次值"; exit 1; }
+[ -z "$T2" ] && { say "!! 终点为空且无上次值"; exit 1; }
+[ "$T2" \< "$T1" ] && { say "!! 终点必须晚于起点"; exit 1; }
+printf 'TBEG="%s"\nTEND="%s"\n' "$T1" "$T2" > "$CFG"
+TAG=$(echo "$T1 $T2" | tr -dc '0-9')
+EXP="diag_report_${TAG}.txt"
+echo "窗口 $T1 ~ $T2   报告: $EXP"
+echo "-- 收集中 (只读查询)..."
+
+run() {
+  sqlplus -S -L "$CONN" <<SQLEOF
+set pagesize 0 linesize 220 trimspool on verify off feedback off echo off define off heading on
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+alter session set nls_timestamp_format='YYYY-MM-DD HH24:MI:SS.FF3';
+$2
+exit
+SQLEOF
+}
+
+IC="__ICOL__"
+IL="__INST_LINE__"
+{
+echo "==================================================================="
+echo " ASH 初步诊断报告 | 数据源: $V"
+echo " 时间窗口 : $T1 ~ $T2    实例: ${INSTF:-全部}"
+echo " 生成时间 : $(date '+%Y-%m-%d %H:%M:%S')    主机: $(hostname)"
+echo " 诊断工具 : ash_analyzer diag (六步法自动版)"
+echo "==================================================================="
+
+run W0 "select 'ROWS_IN_WINDOW: '||count(*) from (
+select *
+  from $V
+ where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+   and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+   $IL);"
+
+echo
+echo "########## 1. 实例分布 ##########"
+run W1 "set lines 220
+col inst heading INST for 9999
+col rows_ heading ROWS for 999999
+col first_sample format a18
+col last_sample format a18
+select $IC inst, count(*) rows_,
+to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') first_sample,
+to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') last_sample
+from $V
+where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+  and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+  $IL
+group by $IC order by 1;"
+
+echo
+echo "########## 2. 顶级等待事件 (症状定性) ##########"
+run W2 "col event format a46 heading EVENT
+col wait_class format a14
+select * from (
+select nvl(event,'ON CPU') event, nvl(wait_class,'-') wait_class,
+count(*) samples, count(*)*10 est_sec
+from $V
+where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+  and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+  $IL
+group by nvl(event,'ON CPU'), nvl(wait_class,'-')
+order by samples desc) where rownum <= 15;"
+
+echo
+echo "########## 3. SQL 排行 (Top15) ##########"
+run W3 "col sql_id format a15
+col opname format a14
+select * from (
+select sql_id, max(sql_opname) opname, count(*) samples
+from $V
+where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+  and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+  and sql_id is not null
+group by sql_id order by samples desc) where rownum <= 15;"
+
+echo
+echo "########## 4. 直接阻塞者 ##########"
+run W4 "col binst heading BINST for 9999
+col bsid heading BSID for 9999999
+col bstat heading STATUS for a9
+select * from (
+select blocking_inst_id binst, blocking_session bsid,
+blocking_session_status bstat, nvl(event,'ON CPU') wait_evt,
+count(*) blocked_samples, count(distinct session_id) blocked_sess
+from $V
+where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+  and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+  and blocking_session is not null
+group by blocking_inst_id, blocking_session, blocking_session_status, nvl(event,'ON CPU')
+order by blocked_samples desc) where rownum <= 12;"
+
+echo
+echo "########## 5. 根阻塞者 (等待树终点) ##########"
+run W5 "col root_inst heading R_INST for 9999
+col root_sid heading R_SID for 9999999
+col root_evt format a34
+select * from (
+select ri root_inst, sid root_sid, max(prog) root_prog, evt root_evt,
+count(*) chains, count(distinct sw) waiters
+from (
+  select connect_by_isleaf isl, $IC ri, session_id sid,
+         program prog, nvl(event,'ON CPU') evt,
+         to_char(connect_by_root($IC))||'.'||to_char(connect_by_root(session_id)) sw
+  from (
+    select /*+ materialize */ *
+    from $V
+    where sample_time >= to_timestamp('$T1','YYYY-MM-DD HH24:MI:SS')
+      and sample_time <= to_timestamp('$T2','YYYY-MM-DD HH24:MI:SS')
+      $IL
+  ) ash
+   start with blocking_session is not null
+  connect by nocycle
+        prior blocking_session = session_id
+        and nvl(nullif(prior blocking_inst_id,0), prior $IC) = $IC
+        and (( prior $IC = $IC
+               and prior to_char(sample_time,'YYYY-MM-DD HH24:MI:SS.FF3') = to_char(sample_time,'YYYY-MM-DD HH24:MI:SS.FF3') )
+             or ( prior $IC <> $IC
+                  and abs((cast(prior sample_time as date) - cast(sample_time as date))*86400) <= 5 ))
+) where isl = 1
+group by ri, sid, evt having count(*) >= 2
+order by chains desc) where rownum <= 12;"
+
+echo
+echo "########## 6. 热点对象 (Top10) ##########"
+run W6 "col objname format a44
+select * from (
+select a.current_obj# obj#,
+nvl(o.owner||'.'||o.object_name,'(未解析)') objname,
+nvl(a.event,'ON CPU') event, count(*) samples
+from $V a, __OBJTBL__ o
+where a.current_obj# > 0 and a.current_obj# = o.object_id (+)
+group by a.current_obj#, nvl(o.owner||'.'||o.object_name,'(未解析)'), nvl(a.event,'ON CPU')
+order by samples desc) where rownum <= 10;"
+} > "$EXP" 2>&1
+
+# ---- 规则化初步结论 (追加到报告) ----
+{
+echo
+echo "########## 8. 初步结论 (规则自动生成) ##########"
+NROW=$(grep -m1 ROWS_IN_WINDOW "$EXP" | grep -o '[0-9]*$')
+if [ -z "$NROW" ] || [ "$NROW" -eq 0 ]; then
+  echo "!! 窗口内无样本: 检查数据源/时间窗/AWR flush"
+else
+  TOP=$(awk '/顶级等待事件 \(症状定性\)/{f=1;next} /SQL 排行/{f=0} f && $0 !~ /^(=|[[:space:]]*$|----|########)/ {n=$(NF-1); $NF=""; $(NF-1)=""; e=$0; sub(/[[:space:]]+$/, "", e); gsub(/[[:space:]]+/, " ", e); if (e != "" && n ~ /^[0-9]+$/) print e "\t" n}' "$EXP" | head -3)
+  echo "样本量: $NROW"
+  echo "Top3 事件指向:"
+  while IFS=$'\t' read -r ev n; do
+    ev="${ev//$'\t'/ }"
+    [ -z "$ev" ] && continue
+    if   [[ "$ev" == *HW* ]]; then say "  $ev ($n 样本) -> 段高水位(HWM)推进争用: 大批量插入/LOB; 结合热点对象节"
+    elif [[ "$ev" == *TX* ]]; then say "  $ev ($n 样本) -> 行锁争用: 应用事务/并发更新; 结合阻塞者节"
+    elif [[ "$ev" == gc* ]]; then say "  $ev ($n 样本) -> RAC 集群块争用: 多为本地慢传导, 看根阻塞者节 root_evt"
+    elif [[ "$ev" == *latch* || "$ev" == *mutex* || "$ev" == *pin* ]]; then say "  $ev ($n 样本) -> 内存结构争用: 查硬解析/SGA"
+    elif [[ "$ev" == *'log file'* ]]; then say "  $ev ($n 样本) -> redo 瓶颈: LGWR I/O / 归档"
+    elif [[ "$ev" == *'db file'* || "$ev" == cell* ]]; then say "  $ev ($n 样本) -> 数据文件 I/O 慢"
+    elif [[ "$ev" == ON*CPU* ]]; then say "  ON CPU ($n 样本) -> CPU 密集: 结合 OS runqueue"
+    else say "  $ev ($n 样本) -> 见 Oracle 手册"
+    fi
+  done <<< "$TOP"
+  echo
+  echo "根阻塞者节为空: 持有者未被 ASH 采样(空闲), 以直接阻塞者节为准."
+fi
+} >> "$EXP" 2>/dev/null
+
+chmod 644 "$EXP" 2>/dev/null
+echo "完成: $EXP"
+echo "---- 结论摘要 ----"
+sed -n '/8\. 初步结论/,$p' "$EXP" | head -12
+GENEOF
+  # 占位符替换 (__ASH_VIEW__/__ICOL__/__INST_LINE__/__OBJTBL__ 由生成器填入;
+  # 用 sed 而非 heredoc 展开, 避免生成期吃掉运行期变量)
+  sed -i.bak "s|__ASH_VIEW__|$ash_src|; s|__ICOL__|$inst_col|; s|__INST_LINE__|$inst_line|; s|__OBJTBL__|${objtbl:-all_objects}|" "$OUTF" && rm -f "$OUTF.bak"
+  chmod 700 "$OUTF" 2>/dev/null
+
+  echo
+  echo "-- 自诊断脚本已生成: $OUTF (可重复执行; 数据源/时间窗每次输入, 回车沿用)"
+  bash -n "$OUTF" || die "生成的脚本语法检查失败"
+  echo "-- 语法校验: OK"
+  echo "-- 下一步: 发给客户执行 sh $(basename "$OUTF")"
+}
+
+#=====================================================================
+case "$CMD" in
+  info)     cmd_info ;;
+  trend)    build_tw; cmd_trend ;;
+  events)   build_tw; cmd_events ;;
+  sql)      build_tw; cmd_sql ;;
+  sessions) build_tw; cmd_sessions ;;
+  blockers) build_tw; cmd_blockers ;;
+  chain)    if [ -z "$MINS" ] && [ -z "$TBEG" ] && [ -z "$SESSID" ]; then MINS=5; fi
+            build_tw; cmd_chain ;;
+  detail)   build_tw; cmd_detail ;;
+  obj)      build_tw; cmd_obj ;;
+  res)      build_tw; cmd_res ;;
+  text)     cmd_text ;;
+  all)      build_tw; cmd_all ;;
+  export)   cmd_export ;;
+  diag)     cmd_diag ;;
+esac
+
+echo
+echo "done. (ash_analyzer v$VERSION)"
+#=====================================================================
+# end of ash_analyzer
+#=====================================================================
+    ev="\${ev//\$'\t'/ }"
